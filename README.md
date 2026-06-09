@@ -72,6 +72,13 @@ You can override the dataset or output locations:
 python scripts\process_docs.py --dataset msmarco-passage/train --max-docs 10000 --raw-dir data/raw --processed-dir data/processed
 ```
 
+To run the exact commands requested for this project:
+
+```powershell
+venv\Scripts\python.exe scripts\process_docs.py --dataset msmarco-passage/train --max-docs 200000
+venv\Scripts\python.exe scripts\test_index.py --input-dir data\processed --query "cloud storage backup"
+```
+
 ## Run Tests
 
 The current test expects processed documents to already exist in `data/processed`:
