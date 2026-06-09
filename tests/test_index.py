@@ -1,24 +1,33 @@
-import sys
-sys.path.append('.')
 import pickle
+import os
+from pathlib import Path
+
 from services.indexing.inverted_index import InvertedIndex
 from services.query_processing.query_processor import QueryProcessor
 
-# 1. تحميل الوثائق المعالجة
-with open('data/processed/processed_docs_10k.pkl', 'rb') as f:
-    docs = pickle.load(f)
 
-# 2. بناء الفهرس
-index = InvertedIndex()
-index.build(docs)
-index.save()
+def load_processed_docs():
+    input_dir = os.environ.get("IR_PROCESSED_DIR", "data/processed")
+    candidates = [
+        Path(input_dir) / 'processed_docs.pkl',
+        Path(input_dir) / 'processed_docs_10k.pkl',
+    ]
+    for path in candidates:
+        if path.exists():
+            with path.open('rb') as f:
+                return pickle.load(f)
+    raise FileNotFoundError(f"No processed dataset found in {input_dir}")
 
-# 3. اختبار استعلام
-qp = QueryProcessor()
-query = qp.process("cloud storage backup")
 
-print(f"Query tokens: {query['tokens']}")
+def test_index_builds_and_queries():
+    docs = load_processed_docs()
+    index = InvertedIndex()
+    index.build(docs)
 
-for term in query['tokens']:
-    postings = index.get_postings(term)
-    print(f"Term '{term}': {len(postings)} docs, first 5: {postings[:5]}")
+    qp = QueryProcessor()
+    query = qp.process("cloud storage backup")
+
+    assert query["tokens"]
+    for term in query["tokens"]:
+        postings = index.get_postings(term)
+        assert isinstance(postings, list)

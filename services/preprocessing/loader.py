@@ -1,11 +1,35 @@
+import os
+
 import ir_datasets
 import pandas as pd
 from tqdm import tqdm
-import os
-import json
+
+
+def _patch_ir_datasets_text_encoding():
+    """
+    ir_datasets.tsv.FileLineIter uses io.TextIOWrapper without specifying an
+    encoding, so on Windows it can fall back to cp1252 and fail on UTF-8 docs.
+    Force UTF-8 here before any dataset iterators are created.
+    """
+    try:
+        import ir_datasets.formats.tsv as tsv
+    except Exception:
+        return
+
+    original_textio_wrapper = tsv.io.TextIOWrapper
+
+    def utf8_text_wrapper(buffer, *args, **kwargs):
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
+        return original_textio_wrapper(buffer, *args, **kwargs)
+
+    tsv.io.TextIOWrapper = utf8_text_wrapper
+
+
+_patch_ir_datasets_text_encoding()
 
 class DatasetLoader:
-    def __init__(self, dataset_name="msmarco-passage/dev/small", max_docs=None):
+    def __init__(self, dataset_name="msmarco-passage/train", max_docs=None):
         self.dataset_name = dataset_name
         self.max_docs = max_docs
         

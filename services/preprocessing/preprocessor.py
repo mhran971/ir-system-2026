@@ -1,6 +1,6 @@
-import nltk
-import spacy
 import string
+
+import nltk
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from nltk.tokenize import word_tokenize
@@ -11,8 +11,29 @@ class TextPreprocessor:
         self.use_stemming = use_stemming
         self.stemmer = PorterStemmer()
         self.lemmatizer = WordNetLemmatizer()
+        self._ensure_nltk_resources()
         self.stop_words = set(stopwords.words(language))
-        self.nlp = spacy.load('en_core_web_sm')
+        self.nlp = self._load_spacy_model()
+
+    def _ensure_nltk_resources(self):
+        resources = [
+            ('corpora/stopwords', 'stopwords'),
+            ('tokenizers/punkt', 'punkt'),
+            ('corpora/wordnet', 'wordnet'),
+            ('corpora/omw-1.4', 'omw-1.4'),
+        ]
+        for resource_path, package_name in resources:
+            try:
+                nltk.data.find(resource_path)
+            except LookupError:
+                nltk.download(package_name, quiet=True)
+
+    def _load_spacy_model(self):
+        try:
+            import spacy
+            return spacy.load('en_core_web_sm')
+        except Exception:
+            return None
         
     def normalize(self, text):
         return text.lower().strip()
