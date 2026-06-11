@@ -1,5 +1,11 @@
+# import sys
+# import os
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import sys
 import os
+sys.stdout.reconfigure(encoding='utf-8')
+os.environ["PYTHONUTF8"] = "1"
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import ir_datasets
@@ -21,21 +27,15 @@ def preprocess_text(text):
     if not text or not isinstance(text, str):
         return []
     
-    # تحويل إلى حروف صغيرة
+    text = text.encode('utf-8', errors='ignore').decode('utf-8')
     text = text.lower()
-    
-    # إزالة الأرقام
     text = re.sub(r'[0-9]', ' ', text)
-    
-    # إزالة علامات الترقيم
     text = text.translate(str.maketrans('', '', string.punctuation))
     
-    # تجزئة وتنظيف
     tokens = text.split()
     tokens = [t for t in tokens if t not in STOP_WORDS and len(t) > 2]
     
     return tokens
-
 def main():
     print("=" * 50)
     print("Processing MS MARCO Dataset")
