@@ -45,7 +45,7 @@ def main():
     print("=" * 60)
     
     # عدد الوثائق (5000 للاختبار، 200000 للتشغيل الكامل)
-    MAX_DOCS = 5000  # غير هذا الرقم إلى 200000 للبيانات الكاملة
+    MAX_DOCS = 200000  # غير هذا الرقم إلى 200000 للبيانات الكاملة
     
     print(f"\n📊 Configuration:")
     print(f"   Dataset: msmarco-passage/train")

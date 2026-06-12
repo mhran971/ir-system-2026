@@ -29,7 +29,7 @@ class SimpleIndex:
         print(f"Saved to {path}")
 
 def main():
-    input_file = 'data/processed/processed_docs_5000.pkl'
+    input_file = 'data/processed/processed_docs_200000.pkl'
     if not os.path.exists(input_file):
         print(f"File not found: {input_file}")
         return
