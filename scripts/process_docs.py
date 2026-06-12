@@ -1,120 +1,126 @@
-import argparse
-import os
-import pickle
+# scripts/process_docs.py
 import sys
-import time
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pandas as pd
+import ir_datasets
+import pickle
+import re
+import string
+from tqdm import tqdm
 
-sys.path.append('.')
+# قائمة stop words
+STOP_WORDS = {
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
+    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the',
+    'to', 'was', 'were', 'will', 'with', 'i', 'you', 'we', 'they',
+    'this', 'that', 'these', 'those'
+}
 
-from services.config import Config
-from services.preprocessing.loader import DatasetLoader
-from services.preprocessing.preprocessor import TextPreprocessor
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Load, save raw docs, and preprocess an IR dataset.")
-    parser.add_argument(
-        "--dataset",
-        default=Config.DATASET_NAME,
-        help="ir_datasets dataset name to load",
-    )
-    parser.add_argument(
-        "--max-docs",
-        type=int,
-        default=Config.MAX_DOCS,
-        help="Maximum number of documents to load",
-    )
-    parser.add_argument(
-        "--raw-dir",
-        default=Config.DATA_PATH,
-        help="Directory to write raw dataset files",
-    )
-    parser.add_argument(
-        "--processed-dir",
-        default=Config.PROCESSED_PATH,
-        help="Directory to write processed dataset files",
-    )
-    return parser.parse_args()
-
-
-def log_step(message):
-    print(f"\n=== {message} ===")
-
-
-def save_processed_outputs(processed, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-
-    generic_pkl = os.path.join(output_dir, "processed_docs.pkl")
-    legacy_pkl = os.path.join(output_dir, "processed_docs_10k.pkl")
-    generic_csv = os.path.join(output_dir, "processed_docs.csv")
-    legacy_csv = os.path.join(output_dir, "processed_docs_10k.csv")
-
-    with open(generic_pkl, 'wb') as f:
-        pickle.dump(processed, f)
-    with open(legacy_pkl, 'wb') as f:
-        pickle.dump(processed, f)
-
-    proc_df = pd.DataFrame([{k: v for k, v in d.items() if k != 'tokens'} for d in processed])
-    proc_df.to_csv(generic_csv, index=False)
-    proc_df.to_csv(legacy_csv, index=False)
-
-    return generic_pkl, legacy_pkl, generic_csv, legacy_csv
-
-
-def verify_outputs(paths):
-    print("Output files:")
-    for path in paths:
-        exists = os.path.exists(path)
-        size = os.path.getsize(path) if exists else 0
-        status = "OK" if exists else "MISSING"
-        print(f"  [{status}] {path} ({size} bytes)")
-
+def preprocess_text(text):
+    """
+    معالجة النص: تطبيع، تنظيف، تجزئة
+    """
+    if not text or not isinstance(text, str):
+        return []
+    
+    # تحويل إلى حروف صغيرة
+    text = text.lower()
+    
+    # إزالة الأرقام
+    text = re.sub(r'[0-9]', ' ', text)
+    
+    # إزالة علامات الترقيم
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    
+    # تجزئة وتنظيف
+    tokens = text.split()
+    tokens = [t for t in tokens if t not in STOP_WORDS and len(t) > 2]
+    
+    return tokens
 
 def main():
-    args = parse_args()
-    started_at = time.perf_counter()
-
-    log_step("Configuration")
-    print(f"Dataset      : {args.dataset}")
-    print(f"Max docs     : {args.max_docs}")
-    print(f"Raw dir      : {args.raw_dir}")
-    print(f"Processed dir: {args.processed_dir}")
-
-    log_step("Loading raw documents")
-    loader = DatasetLoader(dataset_name=args.dataset, max_docs=args.max_docs)
-    df = loader.load()
-    print(f"Raw docs loaded: {len(df)}")
-
-    log_step("Saving raw documents")
-    raw_csv_path = os.path.join(args.raw_dir, "raw_docs.csv")
-    loader.save_raw(df, raw_csv_path)
-
-    log_step("Preprocessing documents")
-    preprocessor = TextPreprocessor(use_stemming=False)
-    processed = []
-    total = len(df)
-    for idx, row in df.iterrows():
-        tokens = preprocessor.process(row['text'])
-        processed.append({
-            'doc_id': row['doc_id'],
-            'original': row['text'],
+    print("=" * 60)
+    print("📚 MS MARCO Dataset Processor")
+    print("=" * 60)
+    
+    # عدد الوثائق (5000 للاختبار، 200000 للتشغيل الكامل)
+    MAX_DOCS = 5000  # غير هذا الرقم إلى 200000 للبيانات الكاملة
+    
+    print(f"\n📊 Configuration:")
+    print(f"   Dataset: msmarco-passage/train")
+    print(f"   Max documents: {MAX_DOCS}")
+    
+    # تحميل البيانات
+    print(f"\n[1/4] Loading dataset...")
+    dataset = ir_datasets.load('msmarco-passage/train')
+    
+    documents = []
+    for i, doc in enumerate(dataset.docs_iter()):
+        if i >= MAX_DOCS:
+            break
+        documents.append({
+            'doc_id': str(doc.doc_id),
+            'text': doc.text,
+            'original': doc.text
+        })
+        if (i + 1) % 1000 == 0:
+            print(f"   Loaded {i + 1}/{MAX_DOCS} documents")
+    
+    print(f"\n[2/4] Loaded {len(documents)} documents")
+    
+    # حفظ البيانات الخام
+    os.makedirs('data/raw', exist_ok=True)
+    with open('data/raw/raw_docs.pkl', 'wb') as f:
+        pickle.dump(documents, f)
+    print(f"   ✅ Saved raw documents to data/raw/raw_docs.pkl")
+    
+    # معالجة الوثائق
+    print(f"\n[3/4] Preprocessing documents...")
+    processed_docs = []
+    
+    for doc in tqdm(documents, desc="Processing"):
+        tokens = preprocess_text(doc['text'])
+        processed_docs.append({
+            'doc_id': doc['doc_id'],
+            'original': doc['text'],  # النص الأصلي
+            'text': doc['text'],      # النص الأصلي
             'tokens': tokens,
             'processed_text': ' '.join(tokens)
         })
-
-        if (idx + 1) % 1000 == 0 or (idx + 1) == total:
-            print(f"Processed {idx + 1}/{total} documents")
-
-    log_step("Saving processed documents")
-    outputs = save_processed_outputs(processed, args.processed_dir)
-    verify_outputs([raw_csv_path, *outputs])
-
-    elapsed = time.perf_counter() - started_at
-    print(f"\nCompleted successfully in {elapsed:.2f} seconds")
-
+    
+    # حفظ البيانات المعالجة
+    os.makedirs('data/processed', exist_ok=True)
+    output_file = f'data/processed/processed_docs_{MAX_DOCS}.pkl'
+    with open(output_file, 'wb') as f:
+        pickle.dump(processed_docs, f)
+    
+    # حفظ نسخة باسم عام أيضاً
+    with open('data/processed/processed_docs.pkl', 'wb') as f:
+        pickle.dump(processed_docs, f)
+    
+    print(f"\n[4/4] ✅ Saved processed documents to {output_file}")
+    
+    # إحصائيات
+    total_tokens = sum(len(doc['tokens']) for doc in processed_docs)
+    avg_tokens = total_tokens / len(processed_docs) if processed_docs else 0
+    
+    print("\n" + "=" * 60)
+    print("📊 STATISTICS")
+    print("=" * 60)
+    print(f"   Documents processed: {len(processed_docs)}")
+    print(f"   Total tokens: {total_tokens:,}")
+    print(f"   Average tokens per doc: {avg_tokens:.2f}")
+    
+    # عرض مثال
+    if processed_docs:
+        print("\n📄 Example processed document:")
+        example = processed_docs[0]
+        print(f"   Doc ID: {example['doc_id']}")
+        print(f"   Original text: {example['original'][:100]}...")
+        print(f"   Tokens: {example['tokens'][:15]}...")
+    
+    print("\n✅ Done! You can now run: python scripts/build_index.py")
 
 if __name__ == "__main__":
     main()
-
