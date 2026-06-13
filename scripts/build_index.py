@@ -1,71 +1,94 @@
+# scripts/build_index.py
+"""
+Inverted index builder script.
+
+Run ONCE after process_docs.py:
+    python scripts/build_index.py
+
+What it does:
+    1. Loads processed documents from data/processed/
+    2. Calls InvertedIndex service to build the index
+    3. Saves the index to data/index/
+
+This script is just an ORCHESTRATOR.
+All actual logic lives in services/indexing/inverted_index.py.
+"""
+
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pickle
-from collections import defaultdict
+
+# ── Import the indexing SERVICE ───────────────────────────────────────────────
+from services.indexing.inverted_index import InvertedIndex
 
 
-class SimpleIndex:
-    def __init__(self):
-        self.index = defaultdict(list)
+# Where to look for processed docs (priority order)
+PROCESSED_DOC_PATHS = [
+    'data/processed/processed_docs_200000.pkl',
+    'data/processed/processed_docs_5000.pkl',
+    'data/processed/processed_docs.pkl',
+]
 
-    def build(self, documents):
-        print(f"Building index for {len(documents)} docs...")
-        for i, doc in enumerate(documents):
-            doc_id = doc['doc_id']
-            tokens = doc['tokens']
+INDEX_SAVE_PATH = 'data/index/inverted_index.pkl'
 
-            term_freq = {}
-            for term in tokens:
-                term_freq[term] = term_freq.get(term, 0) + 1
 
-            for term, freq in term_freq.items():
-                self.index[term].append((doc_id, freq))
+def load_processed_docs() -> list:
+    """Find and load the processed documents file."""
+    for path in PROCESSED_DOC_PATHS:
+        if os.path.exists(path):
+            print(f"📂 Loading: {path}")
+            with open(path, 'rb') as f:
+                docs = pickle.load(f)
+            print(f"   ✅ Loaded {len(docs)} documents")
+            return docs
 
-            if (i + 1) % 1000 == 0:
-                print(f"  Processed {i + 1} docs")
-
-        print(f"Done! Total unique terms: {len(self.index)}")
-
-    def save(self, path='data/index/index.pkl'):
-        os.makedirs('data/index', exist_ok=True)
-        with open(path, 'wb') as f:
-            pickle.dump(dict(self.index), f)
-        print(f"Saved to {path}")
+    print("❌ No processed documents found.")
+    print("   Run: python scripts/process_docs.py  first.")
+    return []
 
 
 def main():
-    # Try both 5000 and 200000 doc files automatically
-    candidates = [
-        'data/processed/processed_docs_200000.pkl',
-        'data/processed/processed_docs_5000.pkl',
-        'data/processed/processed_docs.pkl',
-    ]
+    print("=" * 60)
+    print("🔨 Building Inverted Index")
+    print("=" * 60)
 
-    input_file = None
-    for path in candidates:
-        if os.path.exists(path):
-            input_file = path
-            break
-
-    if not input_file:
-        print("❌ No processed docs file found.")
-        print("   Run: python scripts/process_docs_new.py  first.")
+    # ── Step 1: Load processed documents ─────────────────────────────────────
+    print("\n[1/3] Loading processed documents...")
+    docs = load_processed_docs()
+    if not docs:
         return
 
-    print(f"📂 Loading: {input_file}")
-    with open(input_file, 'rb') as f:
-        docs = pickle.load(f)
+    # ── Step 2: Build index using the InvertedIndex SERVICE ──────────────────
+    print("\n[2/3] Building inverted index...")
+    index = InvertedIndex()          # ← calls the SERVICE
 
-    print(f"   Loaded {len(docs)} documents")
+    for i, doc in enumerate(docs):
+        doc_id = str(doc['doc_id'])
+        tokens = doc.get('tokens', [])
+        index.add_document(doc_id, tokens)   # ← SERVICE method
 
-    index = SimpleIndex()
-    index.build(docs)
-    index.save()
+        if (i + 1) % 1000 == 0:
+            print(f"   Indexed {i + 1}/{len(docs)} documents")
 
-    print("\n✅ Index built successfully!")
-    print("   Next step: python scripts/build_bert_index.py")
+    stats = index.get_stats()
+    print(f"\n   ✅ Index built:")
+    print(f"      Unique terms     : {stats['unique_terms']:,}")
+    print(f"      Total documents  : {stats['total_documents']:,}")
+    print(f"      Total entries    : {stats['total_entries']:,}")
+
+    # ── Step 3: Save index to disk ────────────────────────────────────────────
+    print(f"\n[3/3] Saving index...")
+    os.makedirs('data/index', exist_ok=True)
+    with open(INDEX_SAVE_PATH, 'wb') as f:
+        pickle.dump(index, f)
+
+    print(f"   ✅ Saved → {INDEX_SAVE_PATH}")
+
+    print(f"\n✅ Done! Next steps:")
+    print(f"   python scripts/build_bert_index.py   (for BERT embeddings)")
+    print(f"   streamlit run ui/app.py               (to launch the UI)")
 
 
 if __name__ == "__main__":

@@ -1,126 +1,128 @@
 # scripts/process_docs.py
+"""
+Data loading and preprocessing script.
+
+Run ONCE to prepare documents for indexing:
+    python scripts/process_docs.py
+
+What it does:
+    1. Loads raw documents from MS MARCO via ir_datasets
+    2. Calls TextPreprocessor service to clean and tokenize
+    3. Saves processed documents to data/processed/
+
+This script is just an ORCHESTRATOR.
+All actual logic lives in services/preprocessing/.
+"""
+
 import sys
 import os
+
+# ── UTF-8 fix for Windows — must be before any other import ──────────────────
+sys.stdout.reconfigure(encoding='utf-8')
+os.environ["PYTHONUTF8"] = "1"
+
+# ── Patch ir_datasets to use UTF-8 (same patch as loader.py) ─────────────────
+import ir_datasets.formats.tsv as _tsv
+import io as _io
+_orig_wrapper = _tsv.io.TextIOWrapper
+def _utf8_wrapper(buffer, *args, **kwargs):
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return _orig_wrapper(buffer, *args, **kwargs)
+_tsv.io.TextIOWrapper = _utf8_wrapper
+
+# ── Now safe to import everything else ───────────────────────────────────────
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import ir_datasets
 import pickle
-import re
-import string
+import ir_datasets
 from tqdm import tqdm
 
-# قائمة stop words
-STOP_WORDS = {
-    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
-    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the',
-    'to', 'was', 'were', 'will', 'with', 'i', 'you', 'we', 'they',
-    'this', 'that', 'these', 'those'
-}
+# ── Import the preprocessing SERVICE ─────────────────────────────────────────
+from services.preprocessing.preprocessor import TextPreprocessor
 
-def preprocess_text(text):
-    """
-    معالجة النص: تطبيع، تنظيف، تجزئة
-    """
-    if not text or not isinstance(text, str):
-        return []
-    
-    # تحويل إلى حروف صغيرة
-    text = text.lower()
-    
-    # إزالة الأرقام
-    text = re.sub(r'[0-9]', ' ', text)
-    
-    # إزالة علامات الترقيم
-    text = text.translate(str.maketrans('', '', string.punctuation))
-    
-    # تجزئة وتنظيف
-    tokens = text.split()
-    tokens = [t for t in tokens if t not in STOP_WORDS and len(t) > 2]
-    
-    return tokens
 
 def main():
     print("=" * 60)
     print("📚 MS MARCO Dataset Processor")
     print("=" * 60)
-    
-    # عدد الوثائق (5000 للاختبار، 200000 للتشغيل الكامل)
-    MAX_DOCS = 200000  # غير هذا الرقم إلى 200000 للبيانات الكاملة
-    
+
+    MAX_DOCS = 5000  # change to 200000 for full run
+
     print(f"\n📊 Configuration:")
-    print(f"   Dataset: msmarco-passage/train")
-    print(f"   Max documents: {MAX_DOCS}")
-    
-    # تحميل البيانات
-    print(f"\n[1/4] Loading dataset...")
+    print(f"   Dataset  : msmarco-passage/train")
+    print(f"   Max docs : {MAX_DOCS}")
+
+    # ── Step 1: Load raw documents ────────────────────────────────────────────
+    print(f"\n[1/3] Loading dataset...")
     dataset = ir_datasets.load('msmarco-passage/train')
-    
-    documents = []
+
+    raw_docs = []
     for i, doc in enumerate(dataset.docs_iter()):
         if i >= MAX_DOCS:
             break
-        documents.append({
-            'doc_id': str(doc.doc_id),
-            'text': doc.text,
-            'original': doc.text
+        raw_docs.append({
+            'doc_id':   str(doc.doc_id),
+            'text':     doc.text,       # original passage text
+            'original': doc.text,       # kept as alias for compatibility
         })
         if (i + 1) % 1000 == 0:
             print(f"   Loaded {i + 1}/{MAX_DOCS} documents")
-    
-    print(f"\n[2/4] Loaded {len(documents)} documents")
-    
-    # حفظ البيانات الخام
+
+    print(f"   ✅ Loaded {len(raw_docs)} documents")
+
+    # Save raw docs
     os.makedirs('data/raw', exist_ok=True)
     with open('data/raw/raw_docs.pkl', 'wb') as f:
-        pickle.dump(documents, f)
-    print(f"   ✅ Saved raw documents to data/raw/raw_docs.pkl")
-    
-    # معالجة الوثائق
-    print(f"\n[3/4] Preprocessing documents...")
+        pickle.dump(raw_docs, f)
+    print(f"   ✅ Saved raw docs → data/raw/raw_docs.pkl")
+
+    # ── Step 2: Preprocess using the TextPreprocessor SERVICE ─────────────────
+    print(f"\n[2/3] Preprocessing with TextPreprocessor service...")
+    preprocessor = TextPreprocessor(use_stemming=False, use_lemmatization=False)
+
     processed_docs = []
-    
-    for doc in tqdm(documents, desc="Processing"):
-        tokens = preprocess_text(doc['text'])
+    for doc in tqdm(raw_docs, desc="Preprocessing"):
+        tokens = preprocessor.process(doc['text'])   # ← calls the SERVICE
         processed_docs.append({
-            'doc_id': doc['doc_id'],
-            'original': doc['text'],  # النص الأصلي
-            'text': doc['text'],      # النص الأصلي
-            'tokens': tokens,
-            'processed_text': ' '.join(tokens)
+            'doc_id':         doc['doc_id'],
+            'text':           doc['text'],            # original text (for BERT + UI display)
+            'original':       doc['text'],            # alias
+            'tokens':         tokens,                 # for inverted index + VSM
+            'processed_text': ' '.join(tokens),       # joined string version
         })
-    
-    # حفظ البيانات المعالجة
+
+    # ── Step 3: Save processed documents ─────────────────────────────────────
+    print(f"\n[3/3] Saving processed documents...")
     os.makedirs('data/processed', exist_ok=True)
-    output_file = f'data/processed/processed_docs_{MAX_DOCS}.pkl'
-    with open(output_file, 'wb') as f:
+
+    # Save with count in filename (used by services to find the right file)
+    numbered_path = f'data/processed/processed_docs_{MAX_DOCS}.pkl'
+    with open(numbered_path, 'wb') as f:
         pickle.dump(processed_docs, f)
-    
-    # حفظ نسخة باسم عام أيضاً
-    with open('data/processed/processed_docs.pkl', 'wb') as f:
-        pickle.dump(processed_docs, f)
-    
-    print(f"\n[4/4] ✅ Saved processed documents to {output_file}")
-    
-    # إحصائيات
-    total_tokens = sum(len(doc['tokens']) for doc in processed_docs)
-    avg_tokens = total_tokens / len(processed_docs) if processed_docs else 0
-    
+
+    print(f"   ✅ Saved → {numbered_path}")
+
+    # ── Statistics ────────────────────────────────────────────────────────────
+    total_tokens = sum(len(d['tokens']) for d in processed_docs)
+    avg_tokens   = total_tokens / len(processed_docs) if processed_docs else 0
+
     print("\n" + "=" * 60)
     print("📊 STATISTICS")
     print("=" * 60)
-    print(f"   Documents processed: {len(processed_docs)}")
-    print(f"   Total tokens: {total_tokens:,}")
-    print(f"   Average tokens per doc: {avg_tokens:.2f}")
-    
-    # عرض مثال
+    print(f"   Documents processed  : {len(processed_docs)}")
+    print(f"   Total tokens         : {total_tokens:,}")
+    print(f"   Avg tokens / doc     : {avg_tokens:.1f}")
+
     if processed_docs:
-        print("\n📄 Example processed document:")
-        example = processed_docs[0]
-        print(f"   Doc ID: {example['doc_id']}")
-        print(f"   Original text: {example['original'][:100]}...")
-        print(f"   Tokens: {example['tokens'][:15]}...")
-    
-    print("\n✅ Done! You can now run: python scripts/build_index.py")
+        ex = processed_docs[0]
+        print(f"\n📄 Example doc [{ex['doc_id']}]:")
+        print(f"   text   : {ex['text'][:100]}...")
+        print(f"   tokens : {ex['tokens'][:10]}...")
+
+    print(f"\n✅ Done! Next step:")
+    print(f"   python scripts/build_index.py")
+
 
 if __name__ == "__main__":
     main()
