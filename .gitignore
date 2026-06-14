@@ -11,3 +11,16 @@ __pycache__/
 *.sqlite3
 .idea/
 .vscode/
+
+# Additional patterns for your specific files
+*.faiss          # FAISS vector store files
+*.csv            # CSV data files
+data/            # Entire data directory (if you don't want any data files)
+data/index/      # Specifically the index directory
+data/processed/  # Specifically the processed data directory
+
+# Alternative: If you want to keep the directory structure but ignore files inside
+# data/index/*
+# data/processed/*
+# !data/index/.gitkeep
+# !data/processed/.gitkeep
