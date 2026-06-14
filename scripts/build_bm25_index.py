@@ -41,6 +41,7 @@ def main():
     print("\n✅ BM25 search system is ready and verified!")
     print("\n🚀 Next steps:")
     print("   - Run interface: streamlit run ui/app.py")
+    print("   - Run interface:   python scripts/build_bert_index.py   (for BERT embeddings)")
 
 
 if __name__ == "__main__":

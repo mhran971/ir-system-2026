@@ -13,3 +13,7 @@ class QueryProcessor:
             'tokens': tokens,
             'processed': ' '.join(tokens)
         }
+
+    def process_query(self, query_text):
+        """Processes query text and returns a list of processed tokens."""
+        return self.process(query_text)['tokens']
