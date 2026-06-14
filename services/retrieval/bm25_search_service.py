@@ -101,7 +101,14 @@ class BM25SearchService:
         """
         Executes query retrieval and BM25 ranking.
         """
+        # Handle empty/whitespace-only queries
+        if not query or not query.strip():
+            return []
+
         # 1. Query processing
+        # CONSISTENCY: Uses the shared QueryProcessor (wrapping the shared TextPreprocessor loaded
+        # from pickle) to tokenize, lowercase, remove stopwords, and lemmatize the query in the exact
+        # same manner as the document collection, ensuring tokens match the inverted index.
         query_tokens = self.query_processor.process_query(query)
         if not query_tokens:
             return []
@@ -120,14 +127,21 @@ class BM25SearchService:
             
             for term in query_tokens:
                 # get term frequency in this document from inverted index
+                # CONSISTENCY: Retrieves the term frequency of the preprocessed query terms inside
+                # the target document from the shared inverted index.
                 tf = self.inverted_index.get_term_frequency(term, doc_id)
                 if tf > 0:
+                    # CONSISTENCY: Uses the precomputed IDF values derived from document collection stats.
+                    # If the term is not precomputed, it computes it on-the-fly using the collection-wide
+                    # doc_frequency from the inverted index and total_docs from the document store.
                     idf = self.idf_values.get(term)
                     if idf is None:
                         # compute on the fly if query term not precomputed
                         df = self.inverted_index.doc_frequency.get(term, 0)
                         idf = self.scorer.compute_idf(df, total_docs)
                     
+                    # CONSISTENCY: Applies mathematical BM25 term scoring with document statistics
+                    # (doc_len and avg_doc_len) corresponding to the processed document store.
                     total_score += self.scorer.score_term(tf, doc_len, avg_doc_len, idf)
             
             if total_score > 0:
