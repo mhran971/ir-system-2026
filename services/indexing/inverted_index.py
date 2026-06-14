@@ -119,6 +119,12 @@ class InvertedIndex:
         """
         return self._index.get(term, {}).copy()
     
+    def get_postings(self, term: str) -> Dict[str, int]:
+        """
+        Get postings for a term mapping doc_id to term frequency.
+        """
+        return self.get_documents_for_term(term)
+    
     def get_document_length(self, doc_id: str) -> int:
         """Get length of a document."""
         return self._doc_lengths.get(doc_id, 0)

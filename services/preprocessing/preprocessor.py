@@ -1,18 +1,234 @@
 # services/preprocessing/preprocessor.py
 import re
 import string
+import logging
+from typing import List, Set, Optional
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer, WordNetLemmatizer
+import nltk
+
+# تحميل البيانات المطلوبة (مرة واحدة فقط)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
+
+# إعداد logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 class TextPreprocessor:
     """
-    معالج النصوص - يقوم بتنظيف وتجهيز النصوص للفهرسة والبحث
+    معالج النصوص الاحترافي
+    
+    يقوم بـ:
+    - تنظيف النصوص
+    - إزالة المحارف الخاصة
+    - تقسيم النصوص لكلمات
+    - إزالة كلمات التوقف
+    - Stemming أو Lemmatization
+    - معالجة الأخطاء
+    
+    مثال الاستخدام:
+    >>> preprocessor = TextPreprocessor(use_lemmatization=True)
+    >>> tokens = preprocessor.process("The quick brown fox jumps!")
+    >>> print(tokens)
+    ['quick', 'brown', 'fox', 'jump']
     """
     
-    def __init__(self, use_stemming=False, use_lemmatization=False):
+    def __init__(
+        self,
+        language: str = 'english',
+        use_stemming: bool = False,
+        use_lemmatization: bool = True,
+        min_token_length: int = 3,
+        remove_numbers: bool = True,
+        lowercase: bool = True,
+        remove_punctuation: bool = True,
+        remove_stopwords: bool = True,
+        custom_stopwords: Optional[Set[str]] = None
+    ):
+        """
+        تهيئة معالج النصوص
+        
+        Args:
+            language: اللغة (english, arabic, etc.)
+            use_stemming: استخدام Stemming
+            use_lemmatization: استخدام Lemmatization
+            min_token_length: الحد الأدنى لطول الكلمة
+            remove_numbers: إزالة الأرقام
+            lowercase: تحويل لحروف صغيرة
+            remove_punctuation: إزالة علامات الترقيم
+            remove_stopwords: إزالة كلمات التوقف
+            custom_stopwords: إضافة كلمات توقف مخصصة
+        """
+        self.language = language
         self.use_stemming = use_stemming
         self.use_lemmatization = use_lemmatization
+        self.min_token_length = min_token_length
+        self.remove_numbers = remove_numbers
+        self.lowercase = lowercase
+        self.remove_punctuation = remove_punctuation
+        self.remove_stopwords = remove_stopwords
         
-        # قائمة stop words شائعة في اللغة الإنجليزية
-        self.stop_words = {
+        # تحميل كلمات التوقف
+        try:
+            self.stop_words = set(stopwords.words(language))
+            logger.info(f"✅ تم تحميل {len(self.stop_words)} كلمة توقف للغة {language}")
+        except Exception as e:
+            logger.warning(f"⚠️ لم يتمكن من تحميل stop words: {e}")
+            self.stop_words = self._get_default_stopwords()
+        
+        # إضافة كلمات توقف مخصصة
+        if custom_stopwords:
+            self.stop_words.update(custom_stopwords)
+        
+        # تهيئة Stemmer و Lemmatizer
+        self.stemmer = PorterStemmer()
+        self.lemmatizer = WordNetLemmatizer()
+        
+        # إحصائيات
+        self.stats = {
+            'texts_processed': 0,
+            'total_tokens': 0,
+            'removed_stopwords': 0,
+            'removed_short_tokens': 0
+        }
+    
+    def process(self, text: str) -> List[str]:
+        """
+        معالجة النص وإرجاع قائمة الكلمات
+        
+        Args:
+            text: النص المراد معالجته
+            
+        Returns:
+            قائمة الكلمات المعالجة
+            
+        Raises:
+            ValueError: إذا كان المدخل غير صحيح
+        """
+        # التحقق من صحة المدخل
+        if not isinstance(text, str):
+            logger.warning(f"⚠️ المدخل ليس نصاً: {type(text)}")
+            raise ValueError(f"Expected str, got {type(text)}")
+        
+        if not text or len(text.strip()) == 0:
+            return []
+        
+        try:
+            # 1. تحويل لحروف صغيرة
+            if self.lowercase:
+                text = text.lower()
+            
+            # 2. إزالة الأرقام
+            if self.remove_numbers:
+                text = re.sub(r'\d+', ' ', text)
+            
+            # 3. إزالة علامات الترقيم
+            if self.remove_punctuation:
+                text = text.translate(str.maketrans('', '', string.punctuation))
+            
+            # 4. إزالة المسافات الزائدة
+            text = re.sub(r'\s+', ' ', text).strip()
+            
+            # 5. تقسيم النص لكلمات
+            tokens = word_tokenize(text)
+            
+            # 6. تصفية الكلمات
+            filtered_tokens = []
+            for token in tokens:
+                # التحقق من الطول
+                if len(token) < self.min_token_length:
+                    self.stats['removed_short_tokens'] += 1
+                    continue
+                
+                # إزالة كلمات التوقف
+                if self.remove_stopwords and token in self.stop_words:
+                    self.stats['removed_stopwords'] += 1
+                    continue
+                
+                filtered_tokens.append(token)
+            
+            # 7. تطبيق Stemming أو Lemmatization
+            if self.use_stemming:
+                processed_tokens = [self._stem(t) for t in filtered_tokens]
+            elif self.use_lemmatization:
+                processed_tokens = [self._lemmatize(t) for t in filtered_tokens]
+            else:
+                processed_tokens = filtered_tokens
+            
+            # تحديث الإحصائيات
+            self.stats['texts_processed'] += 1
+            self.stats['total_tokens'] += len(processed_tokens)
+            
+            return processed_tokens
+        
+        except Exception as e:
+            logger.error(f"❌ خطأ في معالجة النص: {e}")
+            raise
+    
+    def process_batch(self, texts: List[str]) -> List[List[str]]:
+        """
+        معالجة مجموعة من النصوص
+        
+        Args:
+            texts: قائمة النصوص
+            
+        Returns:
+            قائمة قوائم الكلمات المعالجة
+        """
+        logger.info(f"📊 بدء معالجة {len(texts)} نصاً")
+        results = []
+        
+        for i, text in enumerate(texts):
+            try:
+                tokens = self.process(text)
+                results.append(tokens)
+                
+                if (i + 1) % 1000 == 0:
+                    logger.info(f"   ✅ تمت معالجة {i + 1}/{len(texts)} نصاً")
+            except Exception as e:
+                logger.warning(f"   ⚠️ خطأ في النص #{i}: {e}")
+                results.append([])
+        
+        logger.info(f"✅ اكتملت معالجة {len(texts)} نصاً")
+        return results
+    
+    def _stem(self, word: str) -> str:
+        """تطبيق Stemming على الكلمة"""
+        try:
+            return self.stemmer.stem(word)
+        except Exception as e:
+            logger.warning(f"⚠️ خطأ في Stemming: {e}")
+            return word
+    
+    def _lemmatize(self, word: str) -> str:
+        """تطبيق Lemmatization على الكلمة"""
+        try:
+            return self.lemmatizer.lemmatize(word)
+        except Exception as e:
+            logger.warning(f"⚠️ خطأ في Lemmatization: {e}")
+            return word
+    
+    def _get_default_stopwords(self) -> Set[str]:
+        """الحصول على قائمة افتراضية من كلمات التوقف"""
+        return {
             'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
             'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the',
             'to', 'was', 'were', 'will', 'with', 'i', 'you', 'we', 'they',
@@ -25,47 +241,32 @@ class TextPreprocessor:
             'only', 'own', 'same', 'than', 'then', 'too', 'very', 'just'
         }
     
-    def process(self, text):
-        """
-        معالجة النص وإرجاع قائمة الكلمات
-        """
-        if not text or not isinstance(text, str):
-            return []
-        
-        # 1. تحويل إلى حروف صغيرة
-        text = text.lower()
-        
-        # 2. إزالة الأرقام
-        text = re.sub(r'[0-9]', ' ', text)
-        
-        # 3. إزالة علامات الترقيم
-        text = text.translate(str.maketrans('', '', string.punctuation))
-        
-        # 4. تجزئة النص إلى كلمات
-        tokens = text.split()
-        
-        # 5. إزالة stop words والكلمات القصيرة جداً (أقل من 3 حروف)
-        tokens = [t for t in tokens if t not in self.stop_words and len(t) > 2]
-        
-        # 6. تطبيق stemming بسيط إذا كان مطلوباً
-        if self.use_stemming:
-            tokens = [self._simple_stem(t) for t in tokens]
-        
-        return tokens
+    def get_stats(self) -> dict:
+        """الحصول على إحصائيات المعالجة"""
+        return {
+            'texts_processed': self.stats['texts_processed'],
+            'total_tokens': self.stats['total_tokens'],
+            'removed_stopwords': self.stats['removed_stopwords'],
+            'removed_short_tokens': self.stats['removed_short_tokens'],
+            'avg_tokens_per_text': (
+                self.stats['total_tokens'] / self.stats['texts_processed']
+                if self.stats['texts_processed'] > 0
+                else 0
+            )
+        }
     
-    def _simple_stem(self, word):
-        """
-        stemming بسيط - إزالة اللواحق الشائعة
-        """
-        if len(word) < 4:
-            return word
-        
-        suffixes = ['ing', 'ed', 'es', 's', 'ly', 'ment', 'tion', 'ness', 'ing']
-        for suffix in suffixes:
-            if word.endswith(suffix):
-                return word[:-len(suffix)]
-        
-        return word
+    def print_stats(self) -> None:
+        """طباعة الإحصائيات"""
+        stats = self.get_stats()
+        print("\n📊 إحصائيات المعالجة:")
+        print("=" * 50)
+        for key, value in stats.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.2f}")
+            else:
+                print(f"  {key}: {value}")
+        print("=" * 50)
+
 
 # للتوافق مع الكود القديم
 SimplePreprocessor = TextPreprocessor
