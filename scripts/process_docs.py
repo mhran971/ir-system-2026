@@ -103,6 +103,12 @@ def main():
 
     print(f"   ✅ Saved → {numbered_path}")
 
+    # Save the preprocessor to ensure query consistency
+    preprocessor_path = 'data/processed/preprocessor.pkl'
+    with open(preprocessor_path, 'wb') as f:
+        pickle.dump(preprocessor, f)
+    print(f"   ✅ Saved preprocessor → {preprocessor_path}")
+
     # ── Statistics ────────────────────────────────────────────────────────────
     total_tokens = sum(len(d['tokens']) for d in processed_docs)
     avg_tokens   = total_tokens / len(processed_docs) if processed_docs else 0

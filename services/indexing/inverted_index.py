@@ -51,6 +51,24 @@ class InvertedIndex:
         for term, count in term_counts.items():
             self._index[term][doc_id] = count
             self._doc_frequency[term] += 1
+
+    def build(self, docs: List[Dict[str, Any]]) -> None:
+        """
+        Build the inverted index from a list of documents.
+        """
+        for doc in docs:
+            doc_id = str(doc.get('doc_id', ''))
+            tokens = doc.get('tokens', [])
+            if doc_id:
+                self.add_document(doc_id, tokens)
+
+    def save(self, path: str = 'data/index/inverted_index.pkl') -> None:
+        """Save the inverted index to disk using pickle."""
+        import pickle
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
     
     def remove_document(self, doc_id: str) -> None:
         """
@@ -119,11 +137,11 @@ class InvertedIndex:
         """
         return self._index.get(term, {}).copy()
     
-    def get_postings(self, term: str) -> Dict[str, int]:
+    def get_postings(self, term: str) -> List[tuple]:
         """
-        Get postings for a term mapping doc_id to term frequency.
+        Get postings for a term as a list of (doc_id, frequency) tuples.
         """
-        return self.get_documents_for_term(term)
+        return list(self.get_documents_for_term(term).items())
     
     def get_document_length(self, doc_id: str) -> int:
         """Get length of a document."""

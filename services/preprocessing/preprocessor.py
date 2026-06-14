@@ -173,9 +173,15 @@ class TextPreprocessor:
             # 5. تقسيم النص لكلمات
             tokens = word_tokenize(text)
             
+            # POS tagging on the full list of tokens to preserve sentence context
+            if self.use_lemmatization and not self.use_stemming:
+                tagged_tokens = pos_tag(tokens)
+            else:
+                tagged_tokens = [(t, '') for t in tokens]
+            
             # 6. تصفية الكلمات
-            filtered_tokens = []
-            for token in tokens:
+            filtered_tagged_tokens = []
+            for token, tag in tagged_tokens:
                 # التحقق من الطول
                 if len(token) < self.min_token_length:
                     self.stats['removed_short_tokens'] += 1
@@ -186,19 +192,18 @@ class TextPreprocessor:
                     self.stats['removed_stopwords'] += 1
                     continue
                 
-                filtered_tokens.append(token)
+                filtered_tagged_tokens.append((token, tag))
             
             # 7. تطبيق Stemming أو Lemmatization
             if self.use_stemming:
-                processed_tokens = [self._stem(t) for t in filtered_tokens]
+                processed_tokens = [self._stem(t[0]) for t in filtered_tagged_tokens]
             elif self.use_lemmatization:
-                tagged_tokens = pos_tag(filtered_tokens)
                 processed_tokens = [
                     self._lemmatize(word, get_wordnet_pos(tag))
-                    for word, tag in tagged_tokens
+                    for word, tag in filtered_tagged_tokens
                 ]
             else:
-                processed_tokens = filtered_tokens
+                processed_tokens = [t[0] for t in filtered_tagged_tokens]
             
             # تحديث الإحصائيات
             self.stats['texts_processed'] += 1

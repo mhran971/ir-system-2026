@@ -21,6 +21,7 @@ from typing import List, Dict, Any, Optional
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from services.preprocessing.preprocessor import TextPreprocessor
+from services.query_processing.query_processor import QueryProcessor
 from .embedding_model import EmbeddingModel
 from .vector_store import VectorStore
 
@@ -49,7 +50,8 @@ class BERTSearchService:
     """
 
     def __init__(self, model_key: str = "fast", force_rebuild: bool = False):
-        self.preprocessor  = TextPreprocessor()
+        self.query_processor = QueryProcessor()
+        self.preprocessor  = self.query_processor.preprocessor
         self.model         = EmbeddingModel(model_key=model_key)
         self.vector_store: Optional[VectorStore] = None
         self._doc_texts:   Dict[str, str] = {}

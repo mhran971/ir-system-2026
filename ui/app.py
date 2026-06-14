@@ -324,9 +324,7 @@ def _show_matching_details(result: dict, query: str, model: str) -> None:
 
         else:
             svc    = get_simple_service()
-            from services.preprocessing.preprocessor import TextPreprocessor
-            preprocessor = TextPreprocessor()
-            tokens = preprocessor.process(query)
+            tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
 
             for token in tokens:

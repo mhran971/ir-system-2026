@@ -18,7 +18,7 @@ class BM25SearchService:
         query_processor: Optional[QueryProcessor] = None,
         document_store: Optional[DocumentStore] = None,
         inverted_index: Optional[InvertedIndex] = None,
-        k1: float = 1.5,
+        k1: float = 1.2,
         b: float = 0.75
     ):
         self.query_processor = query_processor or QueryProcessor()

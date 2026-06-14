@@ -6,16 +6,19 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 import pickle
 import pandas as pd
 from services.preprocessing.preprocessor import TextPreprocessor
+from services.query_processing.query_processor import QueryProcessor
 
 class SearchService:
     """
     خدمة البحث - تقوم بالبحث في الفهرس وإرجاع النتائج مع النص الكامل
     """
     
-    def __init__(self):
+    def __init__(self, query_processor=None):
         self.index = None
         self.documents = {}  # تخزين محتوى الوثائق
-        self.preprocessor = TextPreprocessor()
+        self.query_processor = query_processor or QueryProcessor()
+        # For backward compatibility if other modules access self.preprocessor
+        self.preprocessor = self.query_processor.preprocessor
         self.load_index()
         self.load_documents()
     
@@ -149,7 +152,7 @@ class SearchService:
             return []
         
         # معالجة الاستعلام
-        tokens = self.preprocessor.process(query)
+        tokens = self.query_processor.process_query(query)
         print(f"🔍 Query: '{query}' -> Tokens: {tokens}")
         
         if not tokens:
