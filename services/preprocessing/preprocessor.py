@@ -4,8 +4,9 @@ import string
 import logging
 from typing import List, Set, Optional
 from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, wordnet
 from nltk.stem import PorterStemmer, WordNetLemmatizer
+from nltk import pos_tag
 import nltk
 
 # تحميل البيانات المطلوبة (مرة واحدة فقط)
@@ -24,12 +25,34 @@ try:
 except LookupError:
     nltk.download('wordnet')
 
+try:
+    nltk.data.find('taggers/averaged_perceptron_tagger')
+except LookupError:
+    try:
+        nltk.download('averaged_perceptron_tagger')
+    except Exception:
+        nltk.download('averaged_perceptron_tagger_eng')
+
 # إعداد logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def get_wordnet_pos(tag: str) -> str:
+    """Map NLTK POS tags to WordNet POS tags."""
+    if tag.startswith('J'):
+        return wordnet.ADJ
+    elif tag.startswith('V'):
+        return wordnet.VERB
+    elif tag.startswith('N'):
+        return wordnet.NOUN
+    elif tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN
 
 
 class TextPreprocessor:
@@ -169,7 +192,11 @@ class TextPreprocessor:
             if self.use_stemming:
                 processed_tokens = [self._stem(t) for t in filtered_tokens]
             elif self.use_lemmatization:
-                processed_tokens = [self._lemmatize(t) for t in filtered_tokens]
+                tagged_tokens = pos_tag(filtered_tokens)
+                processed_tokens = [
+                    self._lemmatize(word, get_wordnet_pos(tag))
+                    for word, tag in tagged_tokens
+                ]
             else:
                 processed_tokens = filtered_tokens
             
@@ -218,9 +245,11 @@ class TextPreprocessor:
             logger.warning(f"⚠️ خطأ في Stemming: {e}")
             return word
     
-    def _lemmatize(self, word: str) -> str:
+    def _lemmatize(self, word: str, pos: Optional[str] = None) -> str:
         """تطبيق Lemmatization على الكلمة"""
         try:
+            if pos:
+                return self.lemmatizer.lemmatize(word, pos)
             return self.lemmatizer.lemmatize(word)
         except Exception as e:
             logger.warning(f"⚠️ خطأ في Lemmatization: {e}")

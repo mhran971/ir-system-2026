@@ -79,7 +79,7 @@ def main():
 
     # ── Step 2: Preprocess using the TextPreprocessor SERVICE ─────────────────
     print(f"\n[2/3] Preprocessing with TextPreprocessor service...")
-    preprocessor = TextPreprocessor(use_stemming=False, use_lemmatization=False)
+    preprocessor = TextPreprocessor(use_stemming=False, use_lemmatization=True)
 
     processed_docs = []
     for doc in tqdm(raw_docs, desc="Preprocessing"):
