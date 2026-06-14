@@ -83,7 +83,14 @@ class VSMSearchService:
         """
         Executes query retrieval and VSM ranking.
         """
+        # Handle empty/whitespace-only queries
+        if not query or not query.strip():
+            return []
+
         # 1. Query processing
+        # CONSISTENCY: Uses the shared QueryProcessor (which wraps the shared TextPreprocessor loaded
+        # from pickle) to tokenize, lowercase, remove stopwords, and lemmatize the query in the exact
+        # same manner as the document collection.
         query_tokens = self.query_processor.process_query(query)
         if not query_tokens:
             return []
@@ -92,14 +99,21 @@ class VSMSearchService:
         candidates = self.inverted_index.get_candidates(query_tokens)
         
         # 3. Query vector generation
+        # Compute term frequency (TF) for query tokens.
         query_tf = VSMScorer.compute_tf(query_tokens, normalize=True)
+        # CONSISTENCY: Reuses the document collection-wide precomputed idf_values to construct the
+        # query's TF-IDF vector. This aligns the query vector with the identical dimensions and term-weights
+        # used for documents, allowing mathematically correct cosine similarity computation.
         query_vector = VSMScorer.compute_tfidf(query_tf, self.idf_values)
         
         # 4. Cosine similarity scoring
         scores = []
         for doc_id in candidates:
+            # Retrieve the document vector which is represented in the same term space
             doc_vector = self.doc_vectors.get(doc_id)
             if doc_vector:
+                # CONSISTENCY: Scores document similarity by comparing query and document vectors
+                # that share the same term-dimension space.
                 score = VSMScorer.cosine_similarity(query_vector, doc_vector)
                 if score > 0:
                     scores.append((doc_id, score))
