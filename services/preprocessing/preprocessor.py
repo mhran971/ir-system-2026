@@ -112,9 +112,9 @@ class TextPreprocessor:
         # تحميل كلمات التوقف
         try:
             self.stop_words = set(stopwords.words(language))
-            logger.info(f"✅ تم تحميل {len(self.stop_words)} كلمة توقف للغة {language}")
+            logger.info(f"✅ Loaded {len(self.stop_words)} stop words for language {language}")
         except Exception as e:
-            logger.warning(f"⚠️ لم يتمكن من تحميل stop words: {e}")
+            logger.warning(f"⚠️ Could not load stop words: {e}")
             self.stop_words = self._get_default_stopwords()
         
         # إضافة كلمات توقف مخصصة
@@ -148,7 +148,7 @@ class TextPreprocessor:
         """
         # التحقق من صحة المدخل
         if not isinstance(text, str):
-            logger.warning(f"⚠️ المدخل ليس نصاً: {type(text)}")
+            logger.warning(f"⚠️ Input is not text: {type(text)}")
             raise ValueError(f"Expected str, got {type(text)}")
         
         if not text or len(text.strip()) == 0:
@@ -212,7 +212,7 @@ class TextPreprocessor:
             return processed_tokens
         
         except Exception as e:
-            logger.error(f"❌ خطأ في معالجة النص: {e}")
+            logger.error(f"❌ Error processing text: {e}")
             raise
     
     def process_batch(self, texts: List[str]) -> List[List[str]]:
@@ -225,7 +225,7 @@ class TextPreprocessor:
         Returns:
             قائمة قوائم الكلمات المعالجة
         """
-        logger.info(f"📊 بدء معالجة {len(texts)} نصاً")
+        logger.info(f"📊 Starting processing of {len(texts)} texts")
         results = []
         
         for i, text in enumerate(texts):
@@ -234,12 +234,12 @@ class TextPreprocessor:
                 results.append(tokens)
                 
                 if (i + 1) % 1000 == 0:
-                    logger.info(f"   ✅ تمت معالجة {i + 1}/{len(texts)} نصاً")
+                    logger.info(f"   ✅ Processed {i + 1}/{len(texts)} texts")
             except Exception as e:
-                logger.warning(f"   ⚠️ خطأ في النص #{i}: {e}")
+                logger.warning(f"   ⚠️ Error in text #{i}: {e}")
                 results.append([])
         
-        logger.info(f"✅ اكتملت معالجة {len(texts)} نصاً")
+        logger.info(f"✅ Completed processing of {len(texts)} texts")
         return results
     
     def _stem(self, word: str) -> str:
@@ -247,7 +247,7 @@ class TextPreprocessor:
         try:
             return self.stemmer.stem(word)
         except Exception as e:
-            logger.warning(f"⚠️ خطأ في Stemming: {e}")
+            logger.warning(f"⚠️ Error in stemming: {e}")
             return word
     
     def _lemmatize(self, word: str, pos: Optional[str] = None) -> str:
@@ -257,7 +257,7 @@ class TextPreprocessor:
                 return self.lemmatizer.lemmatize(word, pos)
             return self.lemmatizer.lemmatize(word)
         except Exception as e:
-            logger.warning(f"⚠️ خطأ في Lemmatization: {e}")
+            logger.warning(f"⚠️ Error in lemmatization: {e}")
             return word
     
     def _get_default_stopwords(self) -> Set[str]:
@@ -292,7 +292,7 @@ class TextPreprocessor:
     def print_stats(self) -> None:
         """طباعة الإحصائيات"""
         stats = self.get_stats()
-        print("\n📊 إحصائيات المعالجة:")
+        print("\n📊 Processing statistics:")
         print("=" * 50)
         for key, value in stats.items():
             if isinstance(value, float):
