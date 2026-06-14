@@ -1,7 +1,7 @@
 # ui/app.py
 """
 IR System 2026 — Streamlit UI
-Supports: VSM TF-IDF | Simple TF-IDF | BERT Embeddings
+Supports: VSM TF-IDF | BM25 | Simple TF-IDF | BERT Embeddings
 """
 
 import streamlit as st
@@ -12,7 +12,8 @@ import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.retrieval.search_service import SearchService
-from services.ranking.vsm_TIf_DF.vsm_tfidf_custom import VSM_TFIDF_Custom
+from services.retrieval.vsm_search_service import VSMSearchService
+from services.retrieval.bm25_search_service import BM25SearchService
 from services.ranking.embeddings.bert_search_service import BERTSearchService
 
 
@@ -20,16 +21,25 @@ from services.ranking.embeddings.bert_search_service import BERTSearchService
 
 @st.cache_resource
 def get_simple_service():
+    """Simple TF-IDF baseline service."""
     return SearchService()
 
 
 @st.cache_resource
 def get_vsm_service():
-    return VSM_TFIDF_Custom()
+    """VSM TF-IDF with cosine similarity."""
+    return VSMSearchService()
+
+
+@st.cache_resource
+def get_bm25_service():
+    """BM25 probabilistic ranking service."""
+    return BM25SearchService(k1=1.5, b=0.75)
 
 
 @st.cache_resource
 def get_bert_service():
+    """BERT semantic search service."""
     return BERTSearchService(model_key="fast")
 
 
@@ -52,16 +62,46 @@ def main():
         model = st.selectbox(
             "📊 Retrieval Model",
             [
-                "VSM_TF-IDF",
-                "BERT Embeddings",
+                "BM25 (Best Matching 25)",
+                "VSM TF-IDF (Cosine Similarity)",
+                "BERT Embeddings (Semantic Search)",
                 "Simple TF-IDF (Baseline)",
             ],
             help=(
+                "**BM25** — Advanced probabilistic ranking (Recommended)\n\n"
                 "**VSM TF-IDF** — Classic vector space model with cosine similarity\n\n"
                 "**BERT Embeddings** — Semantic search using Sentence-BERT + FAISS\n\n"
                 "**Simple TF-IDF** — Baseline inverted index with TF scoring"
             )
         )
+
+        # BM25 parameters (only show when BM25 is selected)
+        if "BM25" in model:
+            st.markdown("---")
+            st.subheader("🎯 BM25 Parameters")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                k1 = st.slider(
+                    "k1 (TF Saturation)", 
+                    min_value=0.5, 
+                    max_value=2.5, 
+                    value=1.5, 
+                    step=0.1,
+                    help="Higher = more influence from term frequency"
+                )
+            with col2:
+                b = st.slider(
+                    "b (Length Normalization)", 
+                    min_value=0.0, 
+                    max_value=1.0, 
+                    value=0.75, 
+                    step=0.05,
+                    help="0 = no normalization, 1 = full normalization"
+                )
+            
+            st.caption(f"BM25 Formula: Σ IDF(q) × ((tf × (k1+1)) / (tf + k1 × (1-b + b×|D|/avgDL)))")
+            st.caption(f"Current: k1={k1}, b={b}")
 
         top_k = st.slider("📄 Number of results", 5, 50, 10)
 
@@ -76,20 +116,31 @@ def main():
 
         # Stats panel
         try:
-            if model == "VSM_TF-IDF":
-                svc = get_vsm_service()
+            if "BM25" in model:
+                svc = get_bm25_service()
+                stats = svc.get_stats()
                 st.info(
-                    f"📊 **System Stats**\n\n"
-                    f"🔤 Unique terms: {len(svc.inverted_index):,}\n"
-                    f"📄 Documents: {svc.total_docs:,}\n"
-                    f"🎯 Model: VSM + Cosine Similarity"
+                    f"📊 **BM25 Stats**\n\n"
+                    f"🔤 Unique terms: {stats['unique_terms']:,}\n"
+                    f"📄 Documents: {stats['total_documents']:,}\n"
+                    f"📐 Avg length: {stats['avg_doc_length']:.1f}\n"
+                    f"🎯 k1={svc.k1}, b={svc.b}"
                 )
 
-            elif model == "BERT Embeddings":
+            elif "VSM" in model:
+                svc = get_vsm_service()
+                st.info(
+                    f"📊 **VSM Stats**\n\n"
+                    f"🔤 Unique terms: {len(svc.inverted_index):,}\n"
+                    f"📄 Documents: {svc.total_docs:,}\n"
+                    f"🎯 Model: Cosine Similarity"
+                )
+
+            elif "BERT" in model:
                 svc = get_bert_service()
                 stats = svc.get_stats()
                 st.info(
-                    f"📊 **System Stats**\n\n"
+                    f"📊 **BERT Stats**\n\n"
                     f"🤖 Model: {stats['model_name']}\n"
                     f"📐 Vector dim: {stats['vector_dim']}\n"
                     f"📄 Documents: {stats['total_documents']:,}\n"
@@ -99,10 +150,10 @@ def main():
             else:
                 svc = get_simple_service()
                 st.info(
-                    f"📊 **System Stats**\n\n"
+                    f"📊 **Simple TF-IDF Stats**\n\n"
                     f"🔤 Terms in index: {len(svc.index):,}\n"
                     f"📄 Documents: {len(svc.documents):,}\n"
-                    f"🎯 Active model: {model}"
+                    f"🎯 Method: TF Score Sum"
                 )
         except Exception as e:
             st.error(f"Error loading service: {e}")
@@ -143,16 +194,25 @@ def main():
                 results     = []
                 method_used = model
 
-                if model == "VSM_TF-IDF":
-                    results     = get_vsm_service().search(query, top_k=top_k)
+                if "BM25" in model:
+                    svc = get_bm25_service()
+                    # Update parameters if changed
+                    if 'k1' in locals():
+                        svc.k1 = k1
+                        svc.b = b
+                    results = svc.search(query, top_k=top_k)
+                    method_used = f"BM25 (k1={svc.k1}, b={svc.b})"
+
+                elif "VSM" in model:
+                    results = get_vsm_service().search(query, top_k=top_k)
                     method_used = "VSM TF-IDF (Cosine Similarity)"
 
-                elif model == "BERT Embeddings":
-                    results     = get_bert_service().search(query, top_k=top_k)
-                    method_used = f"BERT Semantic Search (FAISS)"
+                elif "BERT" in model:
+                    results = get_bert_service().search(query, top_k=top_k)
+                    method_used = "BERT Semantic Search (FAISS)"
 
                 else:
-                    results     = get_simple_service().search(query, top_k=top_k)
+                    results = get_simple_service().search(query, top_k=top_k)
                     method_used = "Simple TF-IDF (TF Scoring)"
 
             except Exception as e:
@@ -167,27 +227,38 @@ def main():
             st.markdown("---")
 
             for i, result in enumerate(results, 1):
-                st.markdown(f"### {i}. 📄 Document `{result['doc_id']}`")
-                st.markdown(f"**🎯 Relevance Score:** `{result['score']:.4f}`")
+                with st.container():
+                    st.markdown(f"### {i}. 📄 Document `{result['doc_id']}`")
+                    
+                    # Score with color coding
+                    score = result['score']
+                    if score > 0.7:
+                        score_color = "🟢"
+                    elif score > 0.4:
+                        score_color = "🟡"
+                    else:
+                        score_color = "🟠"
+                    
+                    st.markdown(f"**🎯 Relevance Score:** `{score_color} {score:.6f}`")
 
-                if show_score_exp and result.get("method"):
-                    st.caption(f"📐 Scoring method: {result.get('method', method_used)}")
+                    if show_score_exp and result.get("method"):
+                        st.caption(f"📐 Scoring method: {result.get('method', method_used)}")
 
-                if show_text and result.get("text"):
-                    st.markdown("**📖 Document Content:**")
-                    preview = result["text"][:max_text_len]
-                    if len(result["text"]) > max_text_len:
-                        preview += "..."
-                    st.markdown(f"> {preview}")
+                    if show_text and result.get("text"):
+                        st.markdown("**📖 Document Content:**")
+                        preview = result["text"][:max_text_len]
+                        if len(result["text"]) > max_text_len:
+                            preview += "..."
+                        st.markdown(f"> {preview}")
 
-                    with st.expander("📚 Show full document"):
-                        st.write(result.get("full_text", result["text"]))
+                        with st.expander("📚 Show full document"):
+                            st.write(result.get("full_text", result["text"]))
 
-                if show_matching:
-                    with st.expander("🔍 Show matching details"):
-                        _show_matching_details(result, query, model)
+                    if show_matching:
+                        with st.expander("🔍 Show matching terms and scoring details"):
+                            _show_matching_details(result, query, model)
 
-                st.markdown("---")
+                    st.markdown("---")
 
         else:
             st.warning("⚠️ No results found. Try different keywords.")
@@ -195,34 +266,9 @@ def main():
                 "💡 **Search Tips:**\n"
                 "- Try more specific keywords\n"
                 "- Use synonyms\n"
-                "- Run `python scripts/build_index.py` and `python scripts/build_bert_index.py` first"
+                "- For BM25: Run `python scripts/build_bm25_index.py` first\n"
+                "- For BERT: Run `python scripts/build_bert_index.py` first"
             )
-
-    # ── About Section ─────────────────────────────────────────────────────────
-    with st.expander("ℹ️ About this system"):
-        st.markdown("""
-        ### 📚 Information Retrieval System 2026
-
-        **Dataset:** MS MARCO Passage
-        - Testing mode: 5,000 documents
-        - Full mode: 200,000 documents
-
-        **Retrieval Models:**
-
-        | Model | Description | Similarity |
-        |-------|-------------|------------|
-        | **VSM TF-IDF** | Vector Space Model with TF-IDF | Cosine Similarity |
-        | **BERT Embeddings** | Sentence-BERT dense vectors + FAISS | Inner Product (≈ Cosine) |
-        | **Simple TF-IDF** | Inverted index with TF scoring | TF Score Sum |
-
-        **Formulas:**
-        - **TF(t,d)** = count(t,d) / len(d)
-        - **IDF(t)** = log₁₀((N+1)/(df(t)+1)) + 1
-        - **TF-IDF(t,d)** = TF × IDF
-        - **BERT cos(q,d)** = q · d  (L2-normalized dot product)
-
-        **Technologies:** Python · Streamlit · scikit-learn · sentence-transformers · FAISS
-        """)
 
 
 # ── Helper: matching details panel ────────────────────────────────────────────
@@ -230,16 +276,17 @@ def main():
 def _show_matching_details(result: dict, query: str, model: str) -> None:
     """Show per-model matching details inside an expander."""
     try:
-        if model == "BERT Embeddings":
+        import streamlit as st
+        if model == "BERT Embeddings (Semantic Search)":
             svc    = get_bert_service()
             tokens = svc.preprocessor.process(query)
             st.write(f"**Query tokens:** `{tokens}`")
             st.write(f"**Score type:** Cosine similarity (BERT vector space)")
             st.write(f"**Score:** `{result['score']:.6f}` — closer to 1.0 = more similar")
 
-        elif model == "VSM_TF-IDF":
+        elif "VSM" in model:
             svc    = get_vsm_service()
-            tokens = svc.preprocessor.process(query)
+            tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
 
             for token in tokens:
@@ -252,9 +299,34 @@ def _show_matching_details(result: dict, query: str, model: str) -> None:
                 else:
                     st.write(f"**`{token}`:** not found in this document")
 
+        elif "BM25" in model:
+            svc = get_bm25_service()
+            tokens = svc.query_processor.process_query(query)
+            st.write(f"**Query tokens:** `{tokens}`")
+            st.write(f"**Parameters:** k1={svc.k1}, b={svc.b}")
+            avg_doc_len = svc.document_store.avg_doc_length
+            doc_len = svc.document_store.get_length(result["doc_id"])
+            st.write(f"Document length: `{doc_len}`, Average length: `{avg_doc_len:.1f}`")
+            
+            for token in tokens:
+                tf = svc.inverted_index.get_term_frequency(token, result["doc_id"])
+                df = svc.inverted_index.doc_frequency.get(token, 0)
+                idf = svc.scorer.compute_idf(df, svc.document_store.total_docs)
+                score = svc.scorer.score_term(tf, doc_len, avg_doc_len, idf)
+                
+                if score > 0:
+                    st.write(f"\n**`{token}`:**")
+                    st.write(f"- TF = `{tf}`")
+                    st.write(f"- IDF = `{idf:.4f}`")
+                    st.write(f"- BM25 Term Score = `{score:.4f}`")
+                else:
+                    st.write(f"**`{token}`:** tf = 0 (no match)")
+
         else:
             svc    = get_simple_service()
-            tokens = svc.preprocessor.process(query)
+            from services.preprocessing.preprocessor import TextPreprocessor
+            preprocessor = TextPreprocessor()
+            tokens = preprocessor.process(query)
             st.write(f"**Query tokens:** `{tokens}`")
 
             for token in tokens:
@@ -276,3 +348,5 @@ def _show_matching_details(result: dict, query: str, model: str) -> None:
 
 if __name__ == "__main__":
     main()
+
+
