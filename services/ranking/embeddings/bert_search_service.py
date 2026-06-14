@@ -166,12 +166,20 @@ class BERTSearchService:
             print("❌ No vector index loaded")
             return []
 
+        # Handle empty/whitespace-only queries
         if not query or not query.strip():
             return []
 
         print(f"\n🔍 BERT Search: '{query}'")
 
+        # CONSISTENCY: SBERT/BERT expects raw, natural language query strings rather than manually tokenized/lemmatized
+        # lists because the transformer's internal tokenizer (e.g., WordPiece/BPE) relies on sentence context and structure.
+        # We use the same EmbeddingModel instance (and configuration) that processed the document corpus to encode the query.
+        # This guarantees both documents and queries reside in the identical dense continuous vector space.
         query_vector = self.model.encode(query)
+        
+        # CONSISTENCY: Performs nearest neighbor search in the FAISS vector store that contains document vectors
+        # generated with the exact same embedding model.
         raw_results  = self.vector_store.search(query_vector, top_k=top_k)
         print(f"   Found {len(raw_results)} candidates")
 
