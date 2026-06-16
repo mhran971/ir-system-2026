@@ -84,6 +84,7 @@ class HybridSearchService:
         Final score: BERT cosine similarity
         """
         print(f"  [Serial] Stage 1: BM25 retrieving {bm25_candidates} candidates...")
+         # Stage 1: BM25 uses QueryProcessor internally (lemmatized tokens)
         bm25_results = self.bm25.search(query, top_k=bm25_candidates)
 
         if not bm25_results:
@@ -95,6 +96,8 @@ class HybridSearchService:
         }
 
         print(f"  [Serial] Stage 2: BERT re-ranking {len(candidate_texts)} candidates...")
+         # Stage 2: BERT receives the RAW query (no preprocessing)
+    # BERT's internal WordPiece tokenizer handles it natively
         query_vector = self.bert.model.encode(query)
 
         reranked = []
