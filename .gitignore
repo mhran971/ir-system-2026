@@ -1,26 +1,78 @@
-﻿venv/
+﻿# ============================================
+# Python Bytecode & Cache
+# ============================================
 __pycache__/
-*.pyc
-*.pyo
-*.pkl
-*.pyd
+*.pyc          # Compiled Python files (e.g., inverted_index.cpython-311.pyc)
+*.pyo          # Optimized compiled files
+*.pyd          # Python DLL files
+
+# ============================================
+# Virtual Environment
+# ============================================
+venv/
+.venv/
+env/
+.env/
+
+# ============================================
+# Environment Variables & Secrets
+# ============================================
 .env
 .env.*
+*.env
+
+# ============================================
+# Databases & SQLite
+# ============================================
 *.db
 *.sqlite
 *.sqlite3
-.idea/
-.vscode/
 
-# Additional patterns for your specific files
-*.faiss          # FAISS vector store files
-*.csv            # CSV data files
-data/            # Entire data directory (if you don't want any data files)
-data/index/      # Specifically the index directory
-data/processed/  # Specifically the processed data directory
+# ============================================
+# IDE / Editor Configurations
+# ============================================
+.idea/         # JetBrains (PyCharm)
+.vscode/       # Visual Studio Code
+*.swp
+*.swo
+*~
 
-# Alternative: If you want to keep the directory structure but ignore files inside
-# data/index/*
-# data/processed/*
+# ============================================
+# Serialized Objects & Index Files
+# Covers: inverted_index.pkl, bert_vector_store.faiss, etc.
+# ============================================
+*.pkl
+*.pickle
+*.faiss
+
+# ============================================
+# Raw & Processed Data Files (CSV)
+# Covers: processed_docs.csv, processed_docs_10k.csv, etc.
+# ============================================
+*.csv
+
+# ============================================
+# Project Data Directories (BEST PRACTICE)
+# This single rule recursively ignores ALL files inside:
+#   - data/index/bert_vector_store.faiss
+#   - data/index/inverted_index.pkl
+#   - data/processed/processed_docs.csv
+#   - data/processed/processed_docs_10k.csv
+# ============================================
+data/
+
+# ============================================
+# Explicit Service Cache Directories
+# (Already covered by __pycache__/ above, but added for extra clarity)
+# ============================================
+services/indexing/__pycache__/
+services/preprocessing/__pycache__/
+services/query_processing/__pycache__/
+
+# ============================================
+# Optional: Keep empty directories in version control
+# Uncomment the lines below if you want Git to keep the folder
+# structure for data/ while ignoring the files inside.
+# ============================================
 # !data/index/.gitkeep
 # !data/processed/.gitkeep

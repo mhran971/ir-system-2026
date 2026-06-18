@@ -3,7 +3,6 @@
 IR System 2026 — Streamlit UI
 Models: BM25 | VSM TF-IDF | BERT Embeddings | Hybrid Serial | Hybrid Parallel | Simple TF-IDF
 """
-
 import streamlit as st
 import sys
 import os
@@ -16,7 +15,7 @@ from services.retrieval.vsm_search_service import VSMSearchService
 from services.retrieval.bm25_search_service import BM25SearchService
 from services.ranking.embeddings.bert_search_service import BERTSearchService
 from services.ranking.hybrid.hybrid_search_service import HybridSearchService
-
+from services.query_processing.query_refiner import QueryRefiner
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
 
@@ -38,13 +37,36 @@ def get_bert_service():
 
 @st.cache_resource
 def get_hybrid_service():
-    # Share the already-loaded BM25 and BERT services to avoid double loading
     return HybridSearchService(
         bm25_service=get_bm25_service(),
         bert_service=get_bert_service(),
     )
 
 
+@st.cache_resource
+def get_refiner():
+    try:
+        bm25 = get_bm25_service()
+
+        known_terms = set(bm25.inverted_index.doc_frequency.keys())
+        term_freqs = dict(bm25.inverted_index.doc_frequency)
+
+        total_docs = bm25.document_store.total_docs
+
+        print(f"📚 Loaded {len(known_terms)} known terms for QueryRefiner")
+
+        return QueryRefiner(
+            known_terms=known_terms,
+            term_frequencies=term_freqs,
+            total_docs=total_docs
+        )
+
+    except Exception as e:
+        st.warning(
+            f"Could not load index vocabulary: {e}. Falling back to generic."
+        )
+
+        return QueryRefiner()
 # ── App ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -67,50 +89,60 @@ def main():
             ],
         )
 
-        # ── BM25 parameters (shown for BM25 and both Hybrid modes) ───────────
+        # ── BM25 parameters ───────────────────────────────────────────
         show_bm25_params = any(x in model for x in ["BM25", "Hybrid"])
         if show_bm25_params:
             st.markdown("---")
             st.subheader("🎯 BM25 Parameters")
             col1, col2 = st.columns(2)
             with col1:
-                k1 = st.slider("k1 (TF Saturation)", 0.5, 2.5, 1.5, 0.1,
-                                help="Controls how quickly TF saturates. Higher = more influence from repeated terms.")
+                k1 = st.slider("k1 (TF Saturation)", 0.5, 2.5, 1.5, 0.1)
             with col2:
-                b = st.slider("b (Length Norm)", 0.0, 1.0, 0.75, 0.05,
-                               help="0 = no length penalty, 1 = full normalization.")
-
-            st.caption(f"Formula: IDF × (tf × (k1+1)) / (tf + k1 × (1 - b + b × |D|/avgDL))")
+                b = st.slider("b (Length Norm)", 0.0, 1.0, 0.75, 0.05)
             st.caption(f"Current: **k1 = {k1}**, **b = {b}**")
 
-        # ── Hybrid-specific options ───────────────────────────────────────────
+        # ── Hybrid-specific options ───────────────────────────────────
         if "Hybrid Parallel" in model:
             st.markdown("---")
             st.subheader("🔀 Fusion Settings")
             fusion = st.radio("Fusion method", ["rrf", "linear"],
-                              format_func=lambda x: "RRF (Reciprocal Rank)" if x == "rrf" else "Linear (Weighted Sum)")
-
+                              format_func=lambda x: "RRF" if x == "rrf" else "Linear")
             if fusion == "linear":
                 bm25_w = st.slider("BM25 weight", 0.0, 1.0, 0.4, 0.05)
                 bert_w = st.slider("BERT weight", 0.0, 1.0, 0.6, 0.05)
-                st.caption(f"Combined weight: {bm25_w + bert_w:.2f} (ideally = 1.0)")
-            else:
-                bm25_w, bert_w = 0.4, 0.6   # unused for RRF but needed as defaults
 
         if "Hybrid Serial" in model:
             st.markdown("---")
             st.subheader("🔀 Serial Settings")
-            bm25_candidates = st.slider("BM25 candidates for rerank", 20, 200, 100, 10,
-                                         help="How many BM25 results BERT will re-rank.")
+            bm25_candidates = st.slider("BM25 candidates", 20, 200, 100, 10)
 
         top_k = st.slider("📄 Number of results", 5, 50, 10)
 
+        # ── Query Refinement Options ──────────────────────────────────
+        st.markdown("---")
+        st.subheader("🧠 Query Refinement (Optimized)")
+
+        use_spelling = st.checkbox("✏️  Spelling Correction", value=True,
+                                   help="Fast correction using pyspellchecker + index validation")
+        use_synonyms = st.checkbox("📚 Synonym Expansion (Index-Filtered)", value=True,
+                                   help="Only adds synonyms that exist in the document collection")
+        use_prf = st.checkbox("🔥 PRF (Smart Filtering)", value=True,
+                               help="Extracts max 3 terms using strict IDF/DF thresholds")
+        use_history = st.checkbox("📜 History Weighting", value=True)
+
+        if use_prf:
+            num_prf_terms = st.slider("Number of PRF terms", 1, 5, 3)
+        else:
+            num_prf_terms = 3
+
+        st.caption("⚡ Optimized for speed (< 2s) and relevance (no garbage terms)")
+
+        # ── Display Options ────────────────────────────────────────────
         st.markdown("---")
         st.subheader("🎨 Display")
         show_text      = st.checkbox("📖 Show document text", value=True)
         max_text_len   = st.slider("📏 Max text length", 100, 1000, 300)
         show_matching  = st.checkbox("🔍 Show matching details", value=True)
-        show_score_exp = st.checkbox("📐 Show score explanation", value=False)
 
         st.markdown("---")
         _render_stats(model)
@@ -139,70 +171,114 @@ def main():
         t0 = time.time()
         results = []
         method_used = model
+        refined_query = query
+        refinement_info = {}
 
         with st.spinner("🔍 Searching..."):
             try:
+                refiner = get_refiner()
+
+                if use_history:
+                    refiner.update_history(query)
+
+                prf_docs = []
+                if use_prf:
+                    bm25_temp = get_bm25_service()
+                    prf_docs = bm25_temp.search(query, top_k=5)
+
+                refined = refiner.refine(
+                    query=query,
+                    apply_spelling=use_spelling,
+                    apply_synonyms=use_synonyms,
+                    apply_prf=use_prf,
+                    apply_history=use_history,
+                    top_docs=prf_docs,
+                    num_prf_terms=num_prf_terms,
+                    synonym_limit=1
+                )
+
+                refined_query = refined['expanded_query']
+                refinement_info = refined
+
+                # Default values
+                bm25_candidates = bm25_candidates if 'bm25_candidates' in dir() else 100
+                fusion = fusion if 'fusion' in dir() else "rrf"
+                bm25_w = bm25_w if 'bm25_w' in dir() else 0.4
+                bert_w = bert_w if 'bert_w' in dir() else 0.6
+
+                # Execute search
                 if "BM25" in model and "Hybrid" not in model:
                     svc = get_bm25_service()
                     svc.k1 = k1
-                    svc.b  = b
-                    results = svc.search(query, top_k=top_k)
-                    method_used = f"BM25 (k1={k1}, b={b})"
+                    svc.b = b
+                    results = svc.search(refined_query, top_k=top_k)
+                    method_used = f"BM25 (k1={k1}, b={b}) + Refinement"
 
                 elif "Hybrid Serial" in model:
                     svc = get_hybrid_service()
                     svc.k1 = k1
-                    svc.b  = b
-                    cands = bm25_candidates if "bm25_candidates" in dir() else 100
-                    results = svc.search(query, mode="serial", top_k=top_k, bm25_candidates=cands)
-                    method_used = f"Hybrid Serial — BM25(k1={k1},b={b}) → BERT rerank"
+                    svc.b = b
+                    results = svc.search(refined_query, mode="serial", top_k=top_k, bm25_candidates=bm25_candidates)
+                    method_used = f"Hybrid Serial + Refinement"
 
                 elif "Hybrid Parallel" in model:
                     svc = get_hybrid_service()
                     svc.k1 = k1
-                    svc.b  = b
-                    fus   = fusion if "fusion" in dir() else "rrf"
-                    bw    = bm25_w if "bm25_w" in dir() else 0.4
-                    ew    = bert_w if "bert_w" in dir() else 0.6
-                    results = svc.search(query, mode="parallel", fusion=fus,
-                                         top_k=top_k, bm25_weight=bw, bert_weight=ew)
-                    method_used = f"Hybrid Parallel {fus.upper()} — BM25(k1={k1},b={b}) + BERT"
+                    svc.b = b
+                    results = svc.search(refined_query, mode="parallel", fusion=fusion,
+                                         top_k=top_k, bm25_weight=bm25_w, bert_weight=bert_w)
+                    method_used = f"Hybrid Parallel {fusion.upper()} + Refinement"
 
                 elif "VSM" in model:
-                    results = get_vsm_service().search(query, top_k=top_k)
-                    method_used = "VSM TF-IDF (Cosine Similarity)"
+                    results = get_vsm_service().search(refined_query, top_k=top_k)
+                    method_used = "VSM TF-IDF + Refinement"
 
                 elif "BERT" in model:
-                    results = get_bert_service().search(query, top_k=top_k)
-                    method_used = "BERT Semantic Search (FAISS)"
+                    results = get_bert_service().search(refined_query, top_k=top_k)
+                    method_used = "BERT Semantic + Refinement"
 
                 else:
-                    results = get_simple_service().search(query, top_k=top_k)
-                    method_used = "Simple TF-IDF"
+                    results = get_simple_service().search(refined_query, top_k=top_k)
+                    method_used = "Simple TF-IDF + Refinement"
+
+                if results:
+                    for r in results:
+                        r['refinement_info'] = refinement_info
 
             except Exception as e:
                 st.error(f"Search error: {e}")
+                import traceback
+                st.error(traceback.format_exc())
 
         elapsed = time.time() - t0
 
         if results:
             st.success(f"✅ {len(results)} results in {elapsed:.3f}s")
             st.caption(f"📐 Method: {method_used}")
+
+            if use_spelling or use_synonyms or use_prf or use_history:
+                with st.expander("🧠 Query Refinement Summary", expanded=False):
+                    st.write(f"**Original:** `{query}`")
+                    st.write(f"**Refined:** `{refined_query}`")
+                    if refinement_info.get('prf_terms_added'):
+                        st.write(f"**PRF Terms Added:** `{refinement_info['prf_terms_added']}`")
+                    if refinement_info.get('synonyms_added'):
+                        st.write(f"**Synonyms Added:** `{refinement_info['synonyms_added']}`")
+                    if refinement_info.get('history_boost_applied'):
+                        st.write(f"**History Boost:** `{refinement_info['history_boost_applied']}`")
+                    st.write(f"**Final Weights:** `{refinement_info.get('weights', {})}`")
+
             st.markdown("---")
 
             for i, r in enumerate(results, 1):
                 score = r["score"]
-                dot   = "🟢" if score > 0.7 else ("🟡" if score > 0.3 else "🟠")
+                dot = "🟢" if score > 0.7 else ("🟡" if score > 0.3 else "🟠")
 
                 st.markdown(f"### {i}. 📄 `{r['doc_id']}`")
                 st.markdown(f"**🎯 Score:** `{dot} {score:.6f}`")
 
-                # Show hybrid rank info if available
                 if "bm25_rank" in r:
                     st.caption(f"BM25 rank: {r['bm25_rank']} | BERT rank: {r['bert_rank']}")
-
-                if show_score_exp and r.get("method"):
-                    st.caption(f"Method: {r['method']}")
 
                 if show_text and r.get("text"):
                     st.markdown("**📖 Content:**")
@@ -224,25 +300,11 @@ def main():
     # ── About ─────────────────────────────────────────────────────────────────
     with st.expander("ℹ️ About this system"):
         st.markdown("""
-        ### IR System 2026
-
-        | Model | Description | Scoring |
-        |-------|-------------|---------|
-        | **BM25** | Probabilistic, term saturation | BM25 formula |
-        | **Hybrid Serial** | BM25 candidates → BERT rerank | BERT cosine |
-        | **Hybrid Parallel RRF** | BM25 + BERT fused (rank-based) | 1/(k+rank) |
-        | **Hybrid Parallel Linear** | BM25 + BERT fused (score-based) | w1×BM25 + w2×BERT |
-        | **VSM TF-IDF** | Vector Space Model | Cosine similarity |
-        | **BERT** | Semantic dense retrieval | Inner product (FAISS) |
-        | **Simple TF-IDF** | Baseline inverted index | TF sum |
-
-        **BM25 Parameters:**
-        - **k1** — controls term frequency saturation (typical: 1.2–2.0)
-        - **b** — length normalization (0 = off, 0.75 = standard, 1 = full)
-
-        **Hybrid Fusion:**
-        - **RRF** — rank-based, no score normalization needed, very robust
-        - **Linear** — weighted sum of min-max normalized scores, interpretable
+        ### IR System 2026 – Optimized Query Refinement
+        - **Spelling Correction**: Fast pyspellchecker + vocabulary validation.
+        - **Synonym Expansion**: Only adds synonyms present in the index (max 1 per term).
+        - **PRF**: Extracts max 3 terms using strict DF thresholds (min_df=2, max_df=60%).
+        - **History Weighting**: Additive boost for previously searched terms.
         """)
 
 
@@ -251,7 +313,7 @@ def main():
 def _render_stats(model: str):
     try:
         if "Hybrid" in model:
-            svc   = get_hybrid_service()
+            svc = get_hybrid_service()
             stats = svc.get_stats()
             st.info(
                 f"📊 **Hybrid Stats**\n\n"
@@ -262,7 +324,7 @@ def _render_stats(model: str):
                 f"📐 Vector dim: {stats['bert_vector_dim']}"
             )
         elif "BM25" in model:
-            svc   = get_bm25_service()
+            svc = get_bm25_service()
             stats = svc.get_stats()
             st.info(
                 f"📊 **BM25 Stats**\n\n"
@@ -278,7 +340,7 @@ def _render_stats(model: str):
                 f"📄 Docs: {svc.total_docs:,}"
             )
         elif "BERT" in model:
-            svc   = get_bert_service()
+            svc = get_bert_service()
             stats = svc.get_stats()
             st.info(
                 f"📊 **BERT Stats**\n\n"
@@ -301,19 +363,22 @@ def _render_stats(model: str):
 
 def _show_matching(result: dict, query: str, model: str):
     try:
+        ref_info = result.get('refinement_info', {})
+        if ref_info.get('expanded_query'):
+            st.write(f"**Query (refined):** `{ref_info['expanded_query']}`")
+
         if "BERT" in model and "Hybrid" not in model:
-            svc    = get_bert_service()
+            svc = get_bert_service()
             tokens = svc.preprocessor.process(query)
             st.write(f"**Tokens:** `{tokens}`")
-            st.write(f"**Score:** `{result['score']:.6f}` (cosine similarity, 1.0 = identical)")
+            st.write(f"**Score:** `{result['score']:.6f}` (cosine similarity)")
 
         elif "Hybrid Serial" in model:
-            svc    = get_hybrid_service()
+            svc = get_hybrid_service()
             tokens = svc.bm25.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
-            st.write("**Stage 1:** BM25 retrieved candidates")
-            st.write("**Stage 2:** BERT re-ranked by semantic similarity")
-            st.write(f"**Final score:** `{result['score']:.6f}` (BERT cosine)")
+            st.write("**Stage 1:** BM25 → **Stage 2:** BERT rerank")
+            st.write(f"**Final score:** `{result['score']:.6f}`")
 
         elif "Hybrid Parallel" in model:
             svc = get_hybrid_service()
@@ -324,7 +389,7 @@ def _show_matching(result: dict, query: str, model: str):
             st.write(f"**Fused score:** `{result['score']:.6f}`")
 
         elif "VSM" in model:
-            svc    = get_vsm_service()
+            svc = get_vsm_service()
             tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
             for token in tokens:
@@ -335,7 +400,7 @@ def _show_matching(result: dict, query: str, model: str):
                     st.write(f"**`{token}`:** not found in document")
 
         elif "BM25" in model:
-            svc    = get_bm25_service()
+            svc = get_bm25_service()
             tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
             st.write(f"**k1={svc.k1}, b={svc.b}**")
@@ -343,17 +408,17 @@ def _show_matching(result: dict, query: str, model: str):
             dlen = svc.document_store.get_length(result["doc_id"])
             st.write(f"Doc length: `{dlen}` | Avg: `{avg:.1f}`")
             for token in tokens:
-                tf   = svc.inverted_index.get_term_frequency(token, result["doc_id"])
-                df   = svc.inverted_index.doc_frequency.get(token, 0)
-                idf  = svc.scorer.compute_idf(df, svc.document_store.total_docs)
-                sc   = svc.scorer.score_term(tf, dlen, avg, idf)
+                tf = svc.inverted_index.get_term_frequency(token, result["doc_id"])
+                df = svc.inverted_index.doc_frequency.get(token, 0)
+                idf = svc.scorer.compute_idf(df, svc.document_store.total_docs)
+                sc = svc.scorer.score_term(tf, dlen, avg, idf)
                 if sc > 0:
                     st.write(f"**`{token}`:** TF={tf} | IDF={idf:.4f} | BM25={sc:.4f}")
                 else:
                     st.write(f"**`{token}`:** not found")
 
         else:
-            svc    = get_simple_service()
+            svc = get_simple_service()
             tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
             for token in tokens:
