@@ -67,6 +67,15 @@ def main():
             ],
         )
 
+        # ✅ FIX 2: Define all defaults BEFORE the conditional blocks
+        #    so variables are always defined regardless of model selection.
+        k1              = 1.5
+        b               = 0.75
+        fusion          = "rrf"
+        bm25_w          = 0.4
+        bert_w          = 0.6
+        bm25_candidates = 100
+
         # ── BM25 parameters (shown for BM25 and both Hybrid modes) ───────────
         show_bm25_params = any(x in model for x in ["BM25", "Hybrid"])
         if show_bm25_params:
@@ -83,25 +92,31 @@ def main():
             st.caption(f"Formula: IDF × (tf × (k1+1)) / (tf + k1 × (1 - b + b × |D|/avgDL))")
             st.caption(f"Current: **k1 = {k1}**, **b = {b}**")
 
-        # ── Hybrid-specific options ───────────────────────────────────────────
+        # ── Hybrid Parallel options ───────────────────────────────────────────
         if "Hybrid Parallel" in model:
             st.markdown("---")
             st.subheader("🔀 Fusion Settings")
-            fusion = st.radio("Fusion method", ["rrf", "linear"],
-                              format_func=lambda x: "RRF (Reciprocal Rank)" if x == "rrf" else "Linear (Weighted Sum)")
+            fusion = st.radio(
+                "Fusion method", ["rrf", "linear"],
+                format_func=lambda x: "RRF (Reciprocal Rank)" if x == "rrf" else "Linear (Weighted Sum)"
+            )
 
             if fusion == "linear":
+                # ✅ FIX 3: bert_w is always 1 - bm25_w so weights always sum to 1.0
                 bm25_w = st.slider("BM25 weight", 0.0, 1.0, 0.4, 0.05)
-                bert_w = st.slider("BERT weight", 0.0, 1.0, 0.6, 0.05)
-                st.caption(f"Combined weight: {bm25_w + bert_w:.2f} (ideally = 1.0)")
-            else:
-                bm25_w, bert_w = 0.4, 0.6   # unused for RRF but needed as defaults
+                bert_w = round(1.0 - bm25_w, 2)
+                st.slider("BERT weight", 0.0, 1.0, bert_w, 0.05, disabled=True,
+                          help="Auto-set to 1 - BM25 weight so total always = 1.0")
+                st.caption(f"BM25={bm25_w} + BERT={bert_w} = **1.00** ✓")
 
+        # ── Hybrid Serial options ─────────────────────────────────────────────
         if "Hybrid Serial" in model:
             st.markdown("---")
             st.subheader("🔀 Serial Settings")
-            bm25_candidates = st.slider("BM25 candidates for rerank", 20, 200, 100, 10,
-                                         help="How many BM25 results BERT will re-rank.")
+            bm25_candidates = st.slider(
+                "BM25 candidates for rerank", 20, 200, 100, 10,
+                help="How many BM25 results BERT will re-rank."
+            )
 
         top_k = st.slider("📄 Number of results", 5, 50, 10)
 
@@ -118,17 +133,24 @@ def main():
     # ── Query area ────────────────────────────────────────────────────────────
     st.header("📝 Enter your search query")
 
-    examples = ["cloud storage backup", "machine learning algorithms",
-                "data recovery solutions", "artificial intelligence applications"]
+    examples = [
+        "cloud storage backup",
+        "machine learning algorithms",
+        "data recovery solutions",
+        "artificial intelligence applications",
+    ]
     cols = st.columns(len(examples))
     for i, ex in enumerate(examples):
         with cols[i]:
             if st.button(f"🔍 {ex}", key=f"ex_{i}"):
                 st.session_state.query = ex
 
-    query = st.text_input("Search query:", value=st.session_state.get("query", ""),
-                          placeholder="e.g., cloud storage backup solutions...",
-                          label_visibility="collapsed")
+    query = st.text_input(
+        "Search query:",
+        value=st.session_state.get("query", ""),
+        placeholder="e.g., cloud storage backup solutions...",
+        label_visibility="collapsed",
+    )
 
     c1, c2, c3 = st.columns([1, 1, 4])
     with c1:
@@ -147,30 +169,37 @@ def main():
                     svc.k1 = k1
                     svc.b  = b
                     results = svc.search(query, top_k=top_k)
-                    method_used = f"BM25 (k1={k1}, b={b})"
+                    method_used = f"BM25 — rank_bm25.BM25Okapi (k1={k1}, b={b})"
 
                 elif "Hybrid Serial" in model:
                     svc = get_hybrid_service()
                     svc.k1 = k1
                     svc.b  = b
-                    cands = bm25_candidates if "bm25_candidates" in dir() else 100
-                    results = svc.search(query, mode="serial", top_k=top_k, bm25_candidates=cands)
-                    method_used = f"Hybrid Serial — BM25(k1={k1},b={b}) → BERT rerank"
+                    # ✅ FIX 2: use variable directly — no dir() check needed
+                    results = svc.search(
+                        query, mode="serial",
+                        top_k=top_k,
+                        bm25_candidates=bm25_candidates,
+                    )
+                    method_used = f"Hybrid Serial — BM25(k1={k1}, b={b}) → BERT rerank"
 
                 elif "Hybrid Parallel" in model:
                     svc = get_hybrid_service()
                     svc.k1 = k1
                     svc.b  = b
-                    fus   = fusion if "fusion" in dir() else "rrf"
-                    bw    = bm25_w if "bm25_w" in dir() else 0.4
-                    ew    = bert_w if "bert_w" in dir() else 0.6
-                    results = svc.search(query, mode="parallel", fusion=fus,
-                                         top_k=top_k, bm25_weight=bw, bert_weight=ew)
-                    method_used = f"Hybrid Parallel {fus.upper()} — BM25(k1={k1},b={b}) + BERT"
+                    # ✅ FIX 2: use variables directly — no dir() check needed
+                    results = svc.search(
+                        query, mode="parallel",
+                        fusion=fusion,
+                        top_k=top_k,
+                        bm25_weight=bm25_w,
+                        bert_weight=bert_w,
+                    )
+                    method_used = f"Hybrid Parallel {fusion.upper()} — BM25(k1={k1}, b={b}) + BERT"
 
                 elif "VSM" in model:
                     results = get_vsm_service().search(query, top_k=top_k)
-                    method_used = "VSM TF-IDF (Cosine Similarity)"
+                    method_used = "VSM TF-IDF — sklearn TfidfVectorizer (Cosine Similarity)"
 
                 elif "BERT" in model:
                     results = get_bert_service().search(query, top_k=top_k)
@@ -178,7 +207,7 @@ def main():
 
                 else:
                     results = get_simple_service().search(query, top_k=top_k)
-                    method_used = "Simple TF-IDF"
+                    method_used = "Simple TF-IDF (Baseline)"
 
             except Exception as e:
                 st.error(f"Search error: {e}")
@@ -226,23 +255,23 @@ def main():
         st.markdown("""
         ### IR System 2026
 
-        | Model | Description | Scoring |
-        |-------|-------------|---------|
-        | **BM25** | Probabilistic, term saturation | BM25 formula |
-        | **Hybrid Serial** | BM25 candidates → BERT rerank | BERT cosine |
-        | **Hybrid Parallel RRF** | BM25 + BERT fused (rank-based) | 1/(k+rank) |
-        | **Hybrid Parallel Linear** | BM25 + BERT fused (score-based) | w1×BM25 + w2×BERT |
-        | **VSM TF-IDF** | Vector Space Model | Cosine similarity |
-        | **BERT** | Semantic dense retrieval | Inner product (FAISS) |
-        | **Simple TF-IDF** | Baseline inverted index | TF sum |
+        | Model | Library | Scoring |
+        |-------|---------|---------|
+        | **BM25** | `rank_bm25.BM25Okapi` | BM25 formula |
+        | **Hybrid Serial** | BM25 → BERT rerank | BERT cosine similarity |
+        | **Hybrid Parallel RRF** | BM25 + BERT fused | 1/(k+rank_bm25) + 1/(k+rank_bert) |
+        | **Hybrid Parallel Linear** | BM25 + BERT fused | w_bm25 × norm(BM25) + w_bert × norm(BERT) |
+        | **VSM TF-IDF** | `sklearn.TfidfVectorizer` | Cosine similarity |
+        | **BERT** | `sentence-transformers` + FAISS | Inner product (normalized = cosine) |
+        | **Simple TF-IDF** | Custom inverted index | TF sum |
 
         **BM25 Parameters:**
-        - **k1** — controls term frequency saturation (typical: 1.2–2.0)
+        - **k1** — term frequency saturation (typical: 1.2–2.0, default: 1.5)
         - **b** — length normalization (0 = off, 0.75 = standard, 1 = full)
 
-        **Hybrid Fusion:**
-        - **RRF** — rank-based, no score normalization needed, very robust
-        - **Linear** — weighted sum of min-max normalized scores, interpretable
+        **Hybrid Fusion Methods:**
+        - **RRF** — rank-based, robust to score scale mismatch, k=60
+        - **Linear** — weighted sum of min-max normalized scores (weights always sum to 1.0)
         """)
 
 
@@ -274,7 +303,7 @@ def _render_stats(model: str):
             svc = get_vsm_service()
             st.info(
                 f"📊 **VSM Stats**\n\n"
-                f"🔤 Terms: {len(svc.inverted_index):,}\n"
+                f"🔤 Terms: {svc.vectorizer.vocabulary_.__len__():,}\n"
                 f"📄 Docs: {svc.total_docs:,}"
             )
         elif "BERT" in model:
@@ -305,7 +334,7 @@ def _show_matching(result: dict, query: str, model: str):
             svc    = get_bert_service()
             tokens = svc.preprocessor.process(query)
             st.write(f"**Tokens:** `{tokens}`")
-            st.write(f"**Score:** `{result['score']:.6f}` (cosine similarity, 1.0 = identical)")
+            st.write(f"**Score:** `{result['score']:.6f}` (cosine similarity — 1.0 = identical)")
 
         elif "Hybrid Serial" in model:
             svc    = get_hybrid_service()
@@ -313,10 +342,10 @@ def _show_matching(result: dict, query: str, model: str):
             st.write(f"**Query tokens:** `{tokens}`")
             st.write("**Stage 1:** BM25 retrieved candidates")
             st.write("**Stage 2:** BERT re-ranked by semantic similarity")
-            st.write(f"**Final score:** `{result['score']:.6f}` (BERT cosine)")
+            st.write(f"**Final score:** `{result['score']:.6f}` (BERT cosine similarity)")
 
         elif "Hybrid Parallel" in model:
-            svc = get_hybrid_service()
+            svc    = get_hybrid_service()
             tokens = svc.bm25.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
             st.write(f"**BM25 rank:** `{result.get('bm25_rank', '-')}`")
@@ -329,30 +358,47 @@ def _show_matching(result: dict, query: str, model: str):
             st.write(f"**Query tokens:** `{tokens}`")
             for token in tokens:
                 d = svc.get_term_details(result["doc_id"], token)
-                if d["tf"] > 0 or d["idf"] > 0:
-                    st.write(f"**`{token}`:** TF={d['tf']:.4f} | IDF={d['idf']:.4f} | TF-IDF={d['tfidf']:.4f}")
+                if d["tfidf"] > 0:
+                    st.write(
+                        f"**`{token}`:** "
+                        f"TF={d['tf']:.4f} | IDF={d['idf']:.4f} | TF-IDF={d['tfidf']:.4f}"
+                    )
                 else:
                     st.write(f"**`{token}`:** not found in document")
 
         elif "BM25" in model:
+            # ✅ FIX 1: use rank_bm25 directly — no svc.scorer reference
             svc    = get_bm25_service()
             tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
-            st.write(f"**k1={svc.k1}, b={svc.b}**")
-            avg = svc.document_store.avg_doc_length
+            st.write(f"**Library:** `rank_bm25.BM25Okapi` | k1={svc.k1}, b={svc.b}")
+
+            avg  = svc.document_store.avg_doc_length
             dlen = svc.document_store.get_length(result["doc_id"])
-            st.write(f"Doc length: `{dlen}` | Avg: `{avg:.1f}`")
+            st.write(f"**Doc length:** `{dlen}` | **Avg doc length:** `{avg:.1f}`")
+
+            # Get doc index in the ordered list (same order as bm25 corpus)
+            doc_idx = svc.doc_ids.index(result["doc_id"]) if result["doc_id"] in svc.doc_ids else -1
+
             for token in tokens:
-                tf   = svc.inverted_index.get_term_frequency(token, result["doc_id"])
-                df   = svc.inverted_index.doc_frequency.get(token, 0)
-                idf  = svc.scorer.compute_idf(df, svc.document_store.total_docs)
-                sc   = svc.scorer.score_term(tf, dlen, avg, idf)
-                if sc > 0:
-                    st.write(f"**`{token}`:** TF={tf} | IDF={idf:.4f} | BM25={sc:.4f}")
+                tf = svc.inverted_index.get_term_frequency(token, result["doc_id"])
+                if doc_idx >= 0:
+                    # get_scores([token]) → per-doc BM25 score for this single term
+                    per_term_scores = svc.bm25.get_scores([token])
+                    term_score = float(per_term_scores[doc_idx])
                 else:
-                    st.write(f"**`{token}`:** not found")
+                    term_score = 0.0
+
+                if term_score > 0:
+                    st.write(
+                        f"**`{token}`:** "
+                        f"TF={tf} | BM25 contribution={term_score:.4f}"
+                    )
+                else:
+                    st.write(f"**`{token}`:** not found in document")
 
         else:
+            # Simple TF-IDF baseline
             svc    = get_simple_service()
             tokens = svc.query_processor.process_query(query)
             st.write(f"**Query tokens:** `{tokens}`")
@@ -370,7 +416,7 @@ def _show_matching(result: dict, query: str, model: str):
                 st.write(f"- `{token}`: {freq} occurrence(s)")
 
     except Exception as e:
-        st.write(f"Error: {e}")
+        st.write(f"Matching details error: {e}")
 
 
 if __name__ == "__main__":
