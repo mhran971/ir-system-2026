@@ -5,20 +5,58 @@ from typing import List, Dict, Any, Optional
 from services.query_processing.query_processor import QueryProcessor
 from services.indexing.document_store import DocumentStore
 from services.indexing.inverted_index import InvertedIndex
-from services.ranking.bm25_scorer import BM25Scorer
+from rank_bm25 import BM25Okapi
+
+class BM25ScorerCompat:
+    """
+    Compatibility layer for BM25Scorer.
+    Allows UI elements to query individual term scores without using the manual scorer class directly.
+    """
+    def __init__(self, parent_service):
+        self.parent = parent_service
+
+    @property
+    def k1(self) -> float:
+        return self.parent.k1
+
+    @k1.setter
+    def k1(self, value: float):
+        self.parent.k1 = value
+
+    @property
+    def b(self) -> float:
+        return self.parent.b
+
+    @b.setter
+    def b(self, value: float):
+        self.parent.b = value
+
+    def compute_idf(self, df: int, total_docs: int) -> float:
+        import math
+        numerator = total_docs - df + 0.5
+        denominator = df + 0.5
+        return max(math.log(numerator / denominator + 1e-10), 0.0)
+
+    def score_term(self, tf: int, doc_len: int, avg_doc_len: float, idf: float) -> float:
+        if tf <= 0 or idf <= 0:
+            return 0.0
+        length_norm = (1 - self.b) + self.b * (doc_len / avg_doc_len)
+        tf_component = (tf * (self.k1 + 1)) / (tf + self.k1 * length_norm)
+        return idf * tf_component
+
 
 class BM25SearchService:
     """
     Service layer orchestrator for the BM25 retrieval model.
     Coordinates QueryProcessor, InvertedIndex, and DocumentStore,
-    and applies BM25Scorer mathematical ranking.
+    and applies rank_bm25 library for ranking.
     """
     def __init__(
         self,
         query_processor: Optional[QueryProcessor] = None,
         document_store: Optional[DocumentStore] = None,
         inverted_index: Optional[InvertedIndex] = None,
-        k1: float = 1.2,
+        k1: float = 1.5,
         b: float = 0.75
     ):
         self.query_processor = query_processor or QueryProcessor()
@@ -35,12 +73,21 @@ class BM25SearchService:
             
         self.inverted_index = inverted_index or self._load_inverted_index()
         
-        # Initialize the pure math scorer
-        self.scorer = BM25Scorer(k1=k1, b=b)
+        # Get document IDs and tokenized corpus
+        self.doc_ids = list(self.document_store.get_all_documents().keys())
+        tokenized_corpus = [self.document_store.get_doc(doc_id)['tokens'] for doc_id in self.doc_ids]
         
-        # Precompute IDF values for faster online scoring
-        self.idf_values: Dict[str, float] = {}
-        self._precompute_idf()
+        # Initialize BM25Okapi
+        if self.doc_ids:
+            self.bm25 = BM25Okapi(tokenized_corpus, k1=k1, b=b)
+        else:
+            self.bm25 = None
+            
+        # Precompute IDF values for faster online scoring / compatibility
+        self.idf_values: Dict[str, float] = self.bm25.idf if self.bm25 else {}
+        
+        # Initialize compatibility scorer to keep UI working
+        self.scorer = BM25ScorerCompat(self)
 
     def _load_inverted_index(self) -> InvertedIndex:
         index_paths = [
@@ -64,30 +111,23 @@ class BM25SearchService:
             index.add_document(doc_id, doc['tokens'])
         return index
 
-    def _precompute_idf(self) -> None:
-        total_docs = self.document_store.total_docs
-        if total_docs == 0:
-            return
-        
-        doc_freqs = self.inverted_index.doc_frequency
-        for term, df in doc_freqs.items():
-            self.idf_values[term] = self.scorer.compute_idf(df, total_docs)
-
     @property
     def k1(self) -> float:
-        return self.scorer.k1
+        return self.bm25.k1 if self.bm25 else 1.5
 
     @k1.setter
     def k1(self, value: float):
-        self.scorer.k1 = value
+        if self.bm25:
+            self.bm25.k1 = value
 
     @property
     def b(self) -> float:
-        return self.scorer.b
+        return self.bm25.b if self.bm25 else 0.75
 
     @b.setter
     def b(self, value: float):
-        self.scorer.b = value
+        if self.bm25:
+            self.bm25.b = value
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns index and store stats for the UI."""
@@ -99,53 +139,25 @@ class BM25SearchService:
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        Executes query retrieval and BM25 ranking.
+        Executes query retrieval and BM25 ranking using rank_bm25 library.
         """
         # Handle empty/whitespace-only queries
         if not query or not query.strip():
             return []
 
         # 1. Query processing
-        # CONSISTENCY: Uses the shared QueryProcessor (wrapping the shared TextPreprocessor loaded
-        # from pickle) to tokenize, lowercase, remove stopwords, and lemmatize the query in the exact
-        # same manner as the document collection, ensuring tokens match the inverted index.
         query_tokens = self.query_processor.process_query(query)
-        if not query_tokens:
+        if not query_tokens or self.bm25 is None:
             return []
         
-        # 2. Candidate retrieval
-        candidates = self.inverted_index.get_candidates(query_tokens)
+        # 2. Score using rank_bm25
+        doc_scores = self.bm25.get_scores(query_tokens)
         
-        # 3. BM25 Scoring
+        # 3. Associate scores with doc_ids
         scores = []
-        avg_doc_len = self.document_store.avg_doc_length
-        total_docs = self.document_store.total_docs
-        
-        for doc_id in candidates:
-            total_score = 0.0
-            doc_len = self.document_store.get_length(doc_id)
-            
-            for term in query_tokens:
-                # get term frequency in this document from inverted index
-                # CONSISTENCY: Retrieves the term frequency of the preprocessed query terms inside
-                # the target document from the shared inverted index.
-                tf = self.inverted_index.get_term_frequency(term, doc_id)
-                if tf > 0:
-                    # CONSISTENCY: Uses the precomputed IDF values derived from document collection stats.
-                    # If the term is not precomputed, it computes it on-the-fly using the collection-wide
-                    # doc_frequency from the inverted index and total_docs from the document store.
-                    idf = self.idf_values.get(term)
-                    if idf is None:
-                        # compute on the fly if query term not precomputed
-                        df = self.inverted_index.doc_frequency.get(term, 0)
-                        idf = self.scorer.compute_idf(df, total_docs)
-                    
-                    # CONSISTENCY: Applies mathematical BM25 term scoring with document statistics
-                    # (doc_len and avg_doc_len) corresponding to the processed document store.
-                    total_score += self.scorer.score_term(tf, doc_len, avg_doc_len, idf)
-            
-            if total_score > 0:
-                scores.append((doc_id, total_score))
+        for doc_id, score in zip(self.doc_ids, doc_scores):
+            if score > 0:
+                scores.append((doc_id, float(score)))
                 
         # 4. Sort and return top-k
         scores.sort(key=lambda x: x[1], reverse=True)
@@ -161,6 +173,6 @@ class BM25SearchService:
                 'score': round(score, 6),
                 'text': preview,
                 'full_text': text,
-                'method': f'BM25 (k1={self.scorer.k1}, b={self.scorer.b})'
+                'method': f'BM25 (k1={self.k1}, b={self.b})'
             })
         return results

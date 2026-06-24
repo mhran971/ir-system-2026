@@ -5,13 +5,13 @@ from typing import List, Dict, Any, Optional
 from services.query_processing.query_processor import QueryProcessor
 from services.indexing.document_store import DocumentStore
 from services.indexing.inverted_index import InvertedIndex
-from services.ranking.vsm_scorer import VSMScorer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 class VSMSearchService:
     """
     Service layer orchestrator for the Vector Space Model (VSM).
     Coordinates QueryProcessor, InvertedIndex, and DocumentStore,
-    and applies VSMScorer mathematical ranking.
+    and applies TfidfVectorizer from sklearn.
     """
     def __init__(
         self,
@@ -33,11 +33,30 @@ class VSMSearchService:
             
         self.inverted_index = inverted_index or self._load_inverted_index()
         
-        # Document representations
-        self.doc_vectors: Dict[str, Dict[str, float]] = {}
+        self.doc_ids = list(self.document_store.get_all_documents().keys())
+        self.total_docs = len(self.doc_ids)
+        
+        if self.total_docs > 0:
+            tokenized_corpus = [self.document_store.get_doc(doc_id)['tokens'] for doc_id in self.doc_ids]
+            
+            def identity_tokenizer(text):
+                return text
+                
+            self.vectorizer = TfidfVectorizer(
+                tokenizer=identity_tokenizer,
+                preprocessor=identity_tokenizer,
+                token_pattern=None
+            )
+            self.tfidf_matrix = self.vectorizer.fit_transform(tokenized_corpus)
+        else:
+            self.vectorizer = None
+            self.tfidf_matrix = None
+
+        # Build idf_values for compatibility
         self.idf_values: Dict[str, float] = {}
-        self._build_document_vectors()
-        self.total_docs = self.document_store.total_docs
+        if self.vectorizer and hasattr(self.vectorizer, 'vocabulary_'):
+            for term, idx in self.vectorizer.vocabulary_.items():
+                self.idf_values[term] = float(self.vectorizer.idf_[idx])
 
     def _load_inverted_index(self) -> InvertedIndex:
         index_paths = [
@@ -61,24 +80,6 @@ class VSMSearchService:
             index.add_document(doc_id, doc['tokens'])
         return index
 
-    def _build_document_vectors(self) -> None:
-        total_docs = self.document_store.total_docs
-        if total_docs == 0:
-            return
-        
-        # Compute IDF using VSMScorer
-        self.idf_values = VSMScorer.compute_idf(
-            doc_frequency=self.inverted_index.doc_frequency,
-            total_docs=total_docs,
-            smoothing=True
-        )
-        
-        # Compute document TF-IDF vectors
-        for doc_id, doc in self.document_store.get_all_documents().items():
-            tf = VSMScorer.compute_tf(doc['tokens'], normalize=True)
-            self.doc_vectors[doc_id] = VSMScorer.compute_tfidf(tf, self.idf_values)
-        print(f"✅ [VSMSearchService] Precomputed TF-IDF vectors for {len(self.doc_vectors)} documents.")
-
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         Executes query retrieval and VSM ranking.
@@ -88,35 +89,22 @@ class VSMSearchService:
             return []
 
         # 1. Query processing
-        # CONSISTENCY: Uses the shared QueryProcessor (which wraps the shared TextPreprocessor loaded
-        # from pickle) to tokenize, lowercase, remove stopwords, and lemmatize the query in the exact
-        # same manner as the document collection.
         query_tokens = self.query_processor.process_query(query)
-        if not query_tokens:
+        if not query_tokens or self.tfidf_matrix is None:
             return []
         
-        # 2. Candidate retrieval
-        candidates = self.inverted_index.get_candidates(query_tokens)
+        # 2. Vectorize the query
+        query_vector = self.vectorizer.transform([query_tokens])
         
-        # 3. Query vector generation
-        # Compute term frequency (TF) for query tokens.
-        query_tf = VSMScorer.compute_tf(query_tokens, normalize=True)
-        # CONSISTENCY: Reuses the document collection-wide precomputed idf_values to construct the
-        # query's TF-IDF vector. This aligns the query vector with the identical dimensions and term-weights
-        # used for documents, allowing mathematically correct cosine similarity computation.
-        query_vector = VSMScorer.compute_tfidf(query_tf, self.idf_values)
+        # 3. Calculate cosine similarities
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarities = cosine_similarity(self.tfidf_matrix, query_vector).flatten()
         
-        # 4. Cosine similarity scoring
+        # 4. Associate scores with doc_ids
         scores = []
-        for doc_id in candidates:
-            # Retrieve the document vector which is represented in the same term space
-            doc_vector = self.doc_vectors.get(doc_id)
-            if doc_vector:
-                # CONSISTENCY: Scores document similarity by comparing query and document vectors
-                # that share the same term-dimension space.
-                score = VSMScorer.cosine_similarity(query_vector, doc_vector)
-                if score > 0:
-                    scores.append((doc_id, score))
+        for idx, score in enumerate(similarities):
+            if score > 0:
+                scores.append((self.doc_ids[idx], float(score)))
                     
         # 5. Sort and return top-k
         scores.sort(key=lambda x: x[1], reverse=True)
@@ -139,18 +127,21 @@ class VSMSearchService:
     def get_term_details(self, doc_id: str, term: str) -> Dict[str, float]:
         """Get detailed TF, IDF, and TF-IDF values for a term in a document."""
         doc = self.document_store.get_doc(doc_id)
-        if not doc:
+        if not doc or self.vectorizer is None:
             return {'tf': 0.0, 'idf': 0.0, 'tfidf': 0.0}
         
         tokens = doc.get('tokens', [])
-        idf = self.idf_values.get(term, 0.0)
+        
+        # Calculate IDF from vectorizer
+        term_idx = self.vectorizer.vocabulary_.get(term)
+        idf = float(self.vectorizer.idf_[term_idx]) if term_idx is not None else 0.0
         
         # Calculate TF
         tf = 0.0
-        tfidf = 0.0
         term_count = tokens.count(term)
         if term_count > 0 and len(tokens) > 0:
             tf = term_count / len(tokens)
-            tfidf = tf * idf
+            
+        tfidf = tf * idf
             
         return {'tf': tf, 'idf': idf, 'tfidf': tfidf}
