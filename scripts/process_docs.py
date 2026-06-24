@@ -6,7 +6,7 @@ Run ONCE to prepare documents for indexing:
     python scripts/process_docs.py
 
 What it does:
-    1. Loads raw documents from MS MARCO via ir_datasets
+    1. Loads raw documents from ClinicalTrials via ir_datasets
     2. Calls TextPreprocessor service to clean and tokenize
     3. Saves processed documents to data/processed/
 
@@ -44,30 +44,27 @@ from services.preprocessing.preprocessor import TextPreprocessor
 
 def main():
     print("=" * 60)
-    print("📚 MS MARCO Dataset Processor")
+    print("📚 ClinicalTrials Dataset Processor")
     print("=" * 60)
 
-    MAX_DOCS = 5000  # change to 200000 for full run
-
     print(f"\n📊 Configuration:")
-    print(f"   Dataset  : msmarco-passage/train")
-    print(f"   Max docs : {MAX_DOCS}")
+    print(f"   Dataset  : clinicaltrials/2017/trec-pm-2017")
 
     # ── Step 1: Load raw documents ────────────────────────────────────────────
     print(f"\n[1/3] Loading dataset...")
-    dataset = ir_datasets.load('msmarco-passage/train')
+    dataset = ir_datasets.load('clinicaltrials/2017/trec-pm-2017')
 
     raw_docs = []
     for i, doc in enumerate(dataset.docs_iter()):
-        if i >= MAX_DOCS:
-            break
+        fields = [doc.title, doc.condition, doc.summary, doc.detailed_description, doc.eligibility]
+        merged_text = " ".join([f for f in fields if f])
         raw_docs.append({
             'doc_id':   str(doc.doc_id),
-            'text':     doc.text,       # original passage text
-            'original': doc.text,       # kept as alias for compatibility
+            'text':     merged_text,       # merged clinical trial fields
+            'original': merged_text,       # kept as alias for compatibility
         })
-        if (i + 1) % 1000 == 0:
-            print(f"   Loaded {i + 1}/{MAX_DOCS} documents")
+        if (i + 1) % 10000 == 0:
+            print(f"   Loaded {i + 1} documents")
 
     print(f"   ✅ Loaded {len(raw_docs)} documents")
 
@@ -96,12 +93,24 @@ def main():
     print(f"\n[3/3] Saving processed documents...")
     os.makedirs('data/processed', exist_ok=True)
 
-    # Save with count in filename (used by services to find the right file)
-    numbered_path = f'data/processed/processed_docs_{MAX_DOCS}.pkl'
-    with open(numbered_path, 'wb') as f:
+    # Save to data/processed/processed_docs.pkl
+    processed_path = 'data/processed/processed_docs.pkl'
+    with open(processed_path, 'wb') as f:
         pickle.dump(processed_docs, f)
+    print(f"   ✅ Saved → {processed_path}")
 
-    print(f"   ✅ Saved → {numbered_path}")
+    # Save queries and qrels
+    queries = {q.query_id: (q.text if hasattr(q, 'text') else q.default_text()) for q in dataset.queries_iter()}
+    queries_path = 'data/processed/queries.pkl'
+    with open(queries_path, 'wb') as f:
+        pickle.dump(queries, f)
+    print(f"   ✅ Saved queries → {queries_path}")
+
+    qrels = [(q.query_id, q.doc_id, q.relevance) for q in dataset.qrels_iter()]
+    qrels_path = 'data/processed/qrels.pkl'
+    with open(qrels_path, 'wb') as f:
+        pickle.dump(qrels, f)
+    print(f"   ✅ Saved qrels → {qrels_path}")
 
     # Save the preprocessor to ensure query consistency
     preprocessor_path = 'data/processed/preprocessor.pkl'
