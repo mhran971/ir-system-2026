@@ -17,6 +17,7 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
@@ -102,7 +103,11 @@ class HybridSearchService:
             if not text:
                 continue
             doc_vector = self.bert.model.encode(text)
-            score = float((query_vector * doc_vector).sum())
+            def _cosine(v1, v2):
+              denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+              return float(np.dot(v1, v2) / denom) if denom > 1e-9 else 0.0
+
+            score = _cosine(query_vector, doc_vector)
             reranked.append((doc_id, score, text))
 
         reranked.sort(key=lambda x: x[1], reverse=True)
