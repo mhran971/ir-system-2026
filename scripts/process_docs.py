@@ -47,7 +47,7 @@ def main():
     print("📚 MS MARCO Dataset Processor")
     print("=" * 60)
 
-    MAX_DOCS = 5000  # change to 200000 for full run
+    MAX_DOCS = 200000  # change to 200000 for full run
 
     print(f"\n📊 Configuration:")
     print(f"   Dataset  : msmarco-passage/train")
