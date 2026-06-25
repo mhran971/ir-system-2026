@@ -5,51 +5,13 @@ from typing import List, Dict, Any, Optional
 from services.query_processing.query_processor import QueryProcessor
 from services.indexing.document_store import DocumentStore
 from services.indexing.inverted_index import InvertedIndex
-from rank_bm25 import BM25Okapi
-
-class BM25ScorerCompat:
-    """
-    Compatibility layer for BM25Scorer.
-    Allows UI elements to query individual term scores without using the manual scorer class directly.
-    """
-    def __init__(self, parent_service):
-        self.parent = parent_service
-
-    @property
-    def k1(self) -> float:
-        return self.parent.k1
-
-    @k1.setter
-    def k1(self, value: float):
-        self.parent.k1 = value
-
-    @property
-    def b(self) -> float:
-        return self.parent.b
-
-    @b.setter
-    def b(self, value: float):
-        self.parent.b = value
-
-    def compute_idf(self, df: int, total_docs: int) -> float:
-        import math
-        numerator = total_docs - df + 0.5
-        denominator = df + 0.5
-        return max(math.log(numerator / denominator + 1e-10), 0.0)
-
-    def score_term(self, tf: int, doc_len: int, avg_doc_len: float, idf: float) -> float:
-        if tf <= 0 or idf <= 0:
-            return 0.0
-        length_norm = (1 - self.b) + self.b * (doc_len / avg_doc_len)
-        tf_component = (tf * (self.k1 + 1)) / (tf + self.k1 * length_norm)
-        return idf * tf_component
-
+from services.ranking.bm25_scorer import BM25Scorer
 
 class BM25SearchService:
     """
     Service layer orchestrator for the BM25 retrieval model.
     Coordinates QueryProcessor, InvertedIndex, and DocumentStore,
-    and applies rank_bm25 library for ranking.
+    and applies BM25 scoring directly using the inverted index postings.
     """
     def __init__(
         self,
@@ -62,7 +24,7 @@ class BM25SearchService:
         self.query_processor = query_processor or QueryProcessor()
         self.document_store = document_store or DocumentStore()
         
-        # Load document store cache if it has no documents
+        # Load document store cache (metadata only)
         if self.document_store.total_docs == 0:
             doc_paths = [
                 'data/processed/processed_docs.pkl',
@@ -71,21 +33,9 @@ class BM25SearchService:
             
         self.inverted_index = inverted_index or self._load_inverted_index()
         
-        # Get document IDs and tokenized corpus
-        self.doc_ids = list(self.document_store.get_all_documents().keys())
-        tokenized_corpus = [self.document_store.get_doc(doc_id)['tokens'] for doc_id in self.doc_ids]
-        
-        # Initialize BM25Okapi
-        if self.doc_ids:
-            self.bm25 = BM25Okapi(tokenized_corpus, k1=k1, b=b)
-        else:
-            self.bm25 = None
-            
-        # Precompute IDF values for faster online scoring / compatibility
-        self.idf_values: Dict[str, float] = self.bm25.idf if self.bm25 else {}
-        
-        # Initialize compatibility scorer to keep UI working
-        self.scorer = BM25ScorerCompat(self)
+        self._k1 = k1
+        self._b = b
+        self.scorer = BM25Scorer(k1=k1, b=b)
 
     def _load_inverted_index(self) -> InvertedIndex:
         index_paths = [
@@ -102,64 +52,88 @@ class BM25SearchService:
                 except Exception as e:
                     print(f"⚠️ [BM25SearchService] Error loading index from {path}: {e}")
         
-        # Fallback to build new index from document store if not found
         print("⚠️ [BM25SearchService] No inverted index found on disk. Building from store...")
         index = InvertedIndex()
-        for doc_id, doc in self.document_store.get_all_documents().items():
-            index.add_document(doc_id, doc['tokens'])
+        # Fallback to build new index from document store (this uses lazy docs but will require texts)
+        # Note: In production this path should not be hit.
+        for doc_id in self.document_store._doc_lengths.keys():
+            doc = self.document_store.get_doc(doc_id)
+            if doc:
+                index.add_document(doc_id, doc.get('tokens', []))
         return index
+
+    def _rebuild_bm25(self):
+        """Rebuild BM25 scorer with current parameters (instant)."""
+        self.scorer = BM25Scorer(k1=self._k1, b=self._b)
 
     @property
     def k1(self) -> float:
-        return self.bm25.k1 if self.bm25 else 1.5
+        return self._k1
 
     @k1.setter
     def k1(self, value: float):
-        if self.bm25:
-            self.bm25.k1 = value
+        if value <= 0:
+            raise ValueError("k1 must be > 0")
+        self._k1 = value
+        self._rebuild_bm25()
 
     @property
     def b(self) -> float:
-        return self.bm25.b if self.bm25 else 0.75
+        return self._b
 
     @b.setter
     def b(self, value: float):
-        if self.bm25:
-            self.bm25.b = value
+        if not 0 <= value <= 1:
+            raise ValueError("b must be between 0 and 1")
+        self._b = value
+        self._rebuild_bm25()
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns index and store stats for the UI."""
         return {
             'unique_terms': len(self.inverted_index),
-            'total_documents': self.document_store.total_docs,
-            'avg_doc_length': self.document_store.avg_doc_length
+            'total_documents': self.inverted_index.total_documents,
+            'avg_doc_length': self.inverted_index.get_average_document_length(),
+            'k1': self._k1,
+            'b': self._b
         }
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        Executes query retrieval and BM25 ranking using rank_bm25 library.
+        Executes query retrieval and BM25 ranking directly using the inverted index.
         """
-        # Handle empty/whitespace-only queries
         if not query or not query.strip():
             return []
 
-        # 1. Query processing
         query_tokens = self.query_processor.process_query(query)
-        if not query_tokens or self.bm25 is None:
+        if not query_tokens:
             return []
+            
+        scores = {}
+        total_docs = self.inverted_index.total_documents
+        avg_doc_len = self.inverted_index.get_average_document_length()
         
-        # 2. Score using rank_bm25
-        doc_scores = self.bm25.get_scores(query_tokens)
-        
-        # 3. Associate scores with doc_ids
-        scores = []
-        for doc_id, score in zip(self.doc_ids, doc_scores):
-            if score > 0:
-                scores.append((doc_id, float(score)))
+        # Calculate scores for candidate documents containing at least one query term
+        for token in query_tokens:
+            postings = self.inverted_index.get_documents_for_term(token)
+            if not postings:
+                continue
+            
+            df = len(postings)
+            idf = self.scorer.compute_idf(df, total_docs)
+            if idf <= 0:
+                continue
                 
-        # 4. Sort and return top-k
-        scores.sort(key=lambda x: x[1], reverse=True)
-        top_scores = scores[:top_k]
+            for doc_id, tf in postings.items():
+                doc_len = self.inverted_index.get_document_length(doc_id)
+                score = self.scorer.score_term(tf, doc_len, avg_doc_len, idf)
+                scores[doc_id] = scores.get(doc_id, 0.0) + score
+                
+        if not scores:
+            return []
+            
+        # Sort and return top_k
+        top_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         
         results = []
         for doc_id, score in top_scores:
@@ -171,6 +145,27 @@ class BM25SearchService:
                 'score': round(score, 6),
                 'text': preview,
                 'full_text': text,
-                'method': f'BM25 (k1={self.k1}, b={self.b})'
+                'method': f'BM25 (k1={self._k1}, b={self._b})'
             })
         return results
+
+    def get_term_score(self, doc_id: str, term: str) -> Dict[str, float]:
+        """
+        Get detailed term score for a specific document and term.
+        """
+        tf = self.inverted_index.get_term_frequency(term, doc_id)
+        if tf == 0:
+            return {'tf': 0.0, 'idf': 0.0, 'score': 0.0}
+            
+        doc_len = self.inverted_index.get_document_length(doc_id)
+        avg_doc_len = self.inverted_index.get_average_document_length()
+        
+        df = len(self.inverted_index.get_documents_for_term(term))
+        idf = self.scorer.compute_idf(df, self.inverted_index.total_documents)
+        score = self.scorer.score_term(tf, doc_len, avg_doc_len, idf)
+        
+        return {
+            'tf': tf / doc_len if doc_len > 0 else 0.0,
+            'idf': idf,
+            'score': score
+        }

@@ -146,6 +146,13 @@ def main():
 
         st.markdown("---")
         _render_stats(model)
+        
+        st.markdown("---")
+        if st.button("🔄 Clear App Cache", use_container_width=True):
+            st.cache_resource.clear()
+            st.success("Cache cleared! Reloading...")
+            time.sleep(0.5)
+            st.rerun()
 
     # ── Query area ────────────────────────────────────────────────────────────
     st.header("📝 Enter your search query")

@@ -17,11 +17,13 @@ import sys
 import pickle
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from services.preprocessing.preprocessor import TextPreprocessor
 from services.query_processing.query_processor import QueryProcessor
+from services.indexing.document_store import DocumentStore
 from .embedding_model import EmbeddingModel
 from .vector_store import VectorStore
 
@@ -52,8 +54,12 @@ class BERTSearchService:
         self.preprocessor  = self.query_processor.preprocessor
         self.model         = EmbeddingModel(model_key=model_key)
         self.vector_store: Optional[VectorStore] = None
-        self._doc_texts:   Dict[str, str] = {}
+        self._doc_texts:   Dict[str, str] = {} # Stays empty during load to save RAM, populated during build
+        self.document_store = DocumentStore()
         self.total_docs    = 0
+
+        # Load document store metadata
+        self.document_store.load(_PROCESSED_DATA_PATHS)
 
         self._initialize(force_rebuild)
 
@@ -62,6 +68,7 @@ class BERTSearchService:
     def _initialize(self, force_rebuild: bool) -> None:
         if not force_rebuild and os.path.exists(_VECTOR_STORE_PATH):
             self._load_index()
+            self.total_docs = self.vector_store.total if self.vector_store else 0
         else:
             print("🔨 Building BERT index from scratch...")
             docs = self._load_processed_documents()
@@ -72,8 +79,8 @@ class BERTSearchService:
                 )
             self._build_index(docs)
             self._save_index()
+            self.total_docs = len(self._doc_texts)
 
-        self.total_docs = len(self._doc_texts)
         print(f"\n✅ BERTSearchService ready — {self.total_docs} documents indexed")
 
     def _load_processed_documents(self) -> List[Dict]:
@@ -143,11 +150,18 @@ class BERTSearchService:
     def _load_index(self) -> None:
         print("📂 Loading pre-built BERT index from disk...")
         self.vector_store = VectorStore.load(_VECTOR_STORE_PATH)
-        with open(_DOC_TEXT_PATH, "rb") as f:
-            self._doc_texts = pickle.load(f)
-        print(f"   Loaded {len(self._doc_texts)} document texts")
+        # We do NOT load _doc_texts pickle to save memory.
+        # Documents will be fetched on demand from SQLite.
 
     # ── Search ────────────────────────────────────────────────────────────────
+
+    def get_vector(self, doc_id: str) -> Optional[np.ndarray]:
+        """
+        Retrieve the precomputed L2-normalized vector for a given doc_id from FAISS.
+        """
+        if self.vector_store:
+            return self.vector_store.get_vector(doc_id)
+        return None
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
@@ -170,14 +184,10 @@ class BERTSearchService:
 
         print(f"\n🔍 BERT Search: '{query}'")
 
-        # CONSISTENCY: SBERT/BERT expects raw, natural language query strings rather than manually tokenized/lemmatized
-        # lists because the transformer's internal tokenizer (e.g., WordPiece/BPE) relies on sentence context and structure.
-        # We use the same EmbeddingModel instance (and configuration) that processed the document corpus to encode the query.
-        # This guarantees both documents and queries reside in the identical dense continuous vector space.
+        # Encode the query
         query_vector = self.model.encode(query)
         
-        # CONSISTENCY: Performs nearest neighbor search in the FAISS vector store that contains document vectors
-        # generated with the exact same embedding model.
+        # Search the FAISS index
         raw_results  = self.vector_store.search(query_vector, top_k=top_k)
         print(f"   Found {len(raw_results)} candidates")
 
@@ -185,7 +195,9 @@ class BERTSearchService:
         results     = []
 
         for doc_id, score in raw_results:
-            text    = self._doc_texts.get(doc_id, "")
+            # Query document text on-demand from SQLite
+            doc = self.document_store.get_doc(doc_id)
+            text = doc['text'] if doc else ""
             preview = text[:preview_len] + ("..." if len(text) > preview_len else "")
 
             results.append({

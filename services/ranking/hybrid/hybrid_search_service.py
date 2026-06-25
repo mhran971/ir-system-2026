@@ -97,15 +97,24 @@ class HybridSearchService:
 
         print(f"  [Serial] Stage 2: BERT re-ranking {len(candidate_texts)} candidates...")
          # Stage 2: BERT receives the RAW query (no preprocessing)
-    # BERT's internal WordPiece tokenizer handles it natively
+        # BERT's internal WordPiece tokenizer handles it natively
         query_vector = self.bert.model.encode(query)
 
+        import numpy as np
         reranked = []
         for doc_id, text in candidate_texts.items():
             if not text:
                 continue
-            doc_vector = self.bert.model.encode(text)
-            score = float((query_vector * doc_vector).sum())
+            
+            # Fetch precomputed vector from FAISS vector store
+            doc_vector = self.bert.get_vector(doc_id)
+            if doc_vector is not None:
+                score = float(np.dot(query_vector, doc_vector))
+            else:
+                # Fallback to encoding on the fly if not in FAISS index
+                doc_vector = self.bert.model.encode(text)
+                score = float(np.dot(query_vector, doc_vector))
+                
             reranked.append((doc_id, score, text))
 
         reranked.sort(key=lambda x: x[1], reverse=True)

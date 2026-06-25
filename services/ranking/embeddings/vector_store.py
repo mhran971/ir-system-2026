@@ -6,11 +6,9 @@ Responsible ONLY for storing vectors and finding nearest neighbors.
 
 import os
 import pickle
-from typing import List, Tuple, Optional
-
+from typing import List, Tuple, Optional, Dict
 import numpy as np
 import faiss
-
 
 class VectorStore:
     """
@@ -35,6 +33,7 @@ class VectorStore:
         """
         self.dim = dim
         self._doc_ids: List[str] = []          # maps FAISS index position → doc_id
+        self._doc_id_to_idx: Dict[str, int] = {} # maps doc_id → FAISS index position
         self._index = faiss.IndexFlatIP(dim)   # Inner Product = cosine for normalized vecs
         print(f"✅ VectorStore initialized — dim={dim}")
 
@@ -52,8 +51,14 @@ class VectorStore:
             )
 
         vectors = vectors.astype(np.float32)
+        start_idx = len(self._doc_ids)
         self._index.add(vectors)
         self._doc_ids.extend(doc_ids)
+        
+        # Update lookup dictionary
+        for i, doc_id in enumerate(doc_ids):
+            self._doc_id_to_idx[str(doc_id)] = start_idx + i
+            
         print(f"✅ Added {len(doc_ids)} vectors — total: {self.total}")
 
     def search(
@@ -88,6 +93,23 @@ class VectorStore:
             results.append((doc_id, float(score)))
 
         return results
+
+    def get_vector(self, doc_id: str) -> Optional[np.ndarray]:
+        """
+        Retrieve the L2-normalized vector for a given doc_id from FAISS.
+        """
+        doc_id = str(doc_id)
+        if not self._doc_id_to_idx:
+            self._doc_id_to_idx = {d: i for i, d in enumerate(self._doc_ids)}
+            
+        idx = self._doc_id_to_idx.get(doc_id)
+        if idx is not None:
+            try:
+                # FAISS IndexFlatIP supports reconstruct
+                return self._index.reconstruct(idx)
+            except Exception as e:
+                print(f"⚠️ [VectorStore] Error reconstructing vector for index {idx} (doc_id={doc_id}): {e}")
+        return None
 
     def save(self, path: str) -> None:
         """
@@ -136,6 +158,7 @@ class VectorStore:
         store = cls(dim=dim)
         store._index = index
         store._doc_ids = doc_ids
+        store._doc_id_to_idx = {str(doc_id): i for i, doc_id in enumerate(doc_ids)}
 
         print(f"✅ VectorStore loaded — {len(doc_ids)} vectors, dim={dim}")
         return store
