@@ -150,8 +150,12 @@ def main():
     # ── Query area ────────────────────────────────────────────────────────────
     st.header("📝 Enter your search query")
 
-    examples = ["cloud storage backup", "machine learning algorithms",
-                "data recovery solutions", "artificial intelligence applications"]
+    examples = [
+        "Liposarcoma CDK4 Amplification",
+        "Colon cancer KRAS BRAF",
+        "Meningioma NF2 AKT1",
+        "Melanoma BRAF CDKN2A"
+    ]
     cols = st.columns(len(examples))
     for i, ex in enumerate(examples):
         with cols[i]:
@@ -159,7 +163,7 @@ def main():
                 st.session_state.query = ex
 
     query = st.text_input("Search query:", value=st.session_state.get("query", ""),
-                          placeholder="e.g., cloud storage backup solutions...",
+                          placeholder="e.g., Colon cancer KRAS (G13D)...",
                           label_visibility="collapsed")
 
     c1, c2, c3 = st.columns([1, 1, 4])

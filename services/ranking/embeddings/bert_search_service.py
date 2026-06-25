@@ -28,8 +28,6 @@ from .vector_store import VectorStore
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _PROCESSED_DATA_PATHS = [
-    "data/processed/processed_docs_200000.pkl",
-    "data/processed/processed_docs_5000.pkl",
     "data/processed/processed_docs.pkl",
 ]
 

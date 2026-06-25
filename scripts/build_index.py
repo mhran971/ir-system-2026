@@ -24,10 +24,8 @@ import pickle
 from services.indexing.inverted_index import InvertedIndex
 
 
-# Where to look for processed docs (priority order)
+# Where to look for processed docs
 PROCESSED_DOC_PATHS = [
-    'data/processed/processed_docs_200000.pkl',
-    'data/processed/processed_docs_5000.pkl',
     'data/processed/processed_docs.pkl',
 ]
 

@@ -47,9 +47,6 @@ class SearchService:
         
         # قائمة بجميع ملفات الوثائق المحتملة (حسب العدد)
         doc_files = [
-            ('data/processed/processed_docs_200000.pkl', 200000),
-            ('data/processed/processed_docs_5000.pkl', 5000),
-            ('data/processed/processed_docs_10000.pkl', 10000),
             ('data/processed/processed_docs.pkl', None),
             ('data/raw/raw_docs.pkl', None)
         ]

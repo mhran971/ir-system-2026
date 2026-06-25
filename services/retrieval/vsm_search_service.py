@@ -25,8 +25,6 @@ class VSMSearchService:
         # Load document store cache if it has no documents
         if self.document_store.total_docs == 0:
             doc_paths = [
-                'data/processed/processed_docs_200000.pkl',
-                'data/processed/processed_docs_5000.pkl',
                 'data/processed/processed_docs.pkl',
             ]
             self.document_store.load(doc_paths)
