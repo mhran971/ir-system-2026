@@ -17,6 +17,11 @@ from services.retrieval.bm25_search_service import BM25SearchService
 from services.ranking.embeddings.bert_search_service import BERTSearchService
 from services.ranking.hybrid.hybrid_search_service import HybridSearchService
 from services.query_processing.query_refiner import QueryRefiner
+from services.clustering.clustering_service import ClusteringService
+
+def identity_analyzer(doc):
+    """Pass-through analyzer for pre-tokenized inputs in VSM model unpickling."""
+    return doc
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
 
@@ -68,6 +73,11 @@ def get_refiner():
         )
 
         return QueryRefiner()
+
+@st.cache_resource
+def get_clustering_service():
+    return ClusteringService(bert_service=get_bert_service())
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -140,10 +150,11 @@ def main():
 
         # ── Display Options ────────────────────────────────────────────
         st.markdown("---")
-        st.subheader("🎨 Display")
+        st.subheader("🎨 Display & Clustering")
         show_text      = st.checkbox("📖 Show document text", value=True)
         max_text_len   = st.slider("📏 Max text length", 100, 1000, 300)
         show_matching  = st.checkbox("🔍 Show matching details", value=True)
+        n_clusters     = st.slider("🧩 Number of clusters", 2, 8, 4, help="Number of clusters to group search results into.")
 
         st.markdown("---")
         _render_stats(model)
@@ -182,6 +193,9 @@ def main():
             search_btn = st.button("🔍 Search", type="primary", use_container_width=True)
 
         # ── Search ────────────────────────────────────────────────────────────────
+        if "last_search" not in st.session_state:
+            st.session_state.last_search = None
+
         if search_btn and query:
             t0 = time.time()
             results = []
@@ -266,6 +280,24 @@ def main():
                     st.error(traceback.format_exc())
 
             elapsed = time.time() - t0
+            
+            st.session_state.last_search = {
+                "results": results,
+                "method_used": method_used,
+                "refined_query": refined_query,
+                "refinement_info": refinement_info,
+                "elapsed": elapsed,
+                "query": query
+            }
+
+        # Check if we have results in session state to display
+        if st.session_state.last_search is not None:
+            results = st.session_state.last_search["results"]
+            method_used = st.session_state.last_search["method_used"]
+            refined_query = st.session_state.last_search["refined_query"]
+            refinement_info = st.session_state.last_search["refinement_info"]
+            elapsed = st.session_state.last_search["elapsed"]
+            last_query = st.session_state.last_search["query"]
 
             if results:
                 st.success(f"✅ {len(results)} results in {elapsed:.3f}s")
@@ -273,7 +305,7 @@ def main():
 
                 if use_spelling or use_synonyms or use_prf or use_history:
                     with st.expander("🧠 Query Refinement Summary", expanded=False):
-                        st.write(f"**Original:** `{query}`")
+                        st.write(f"**Original:** `{last_query}`")
                         st.write(f"**Refined:** `{refined_query}`")
                         if refinement_info.get('prf_terms_added'):
                             st.write(f"**PRF Terms Added:** `{refinement_info['prf_terms_added']}`")
@@ -285,32 +317,98 @@ def main():
 
                 st.markdown("---")
 
-                for i, r in enumerate(results, 1):
-                    score = r["score"]
-                    dot = "🟢" if score > 0.7 else ("🟡" if score > 0.3 else "🟠")
+                # Show tabs for Standard List vs Clustered Analysis
+                view_tab1, view_tab2 = st.tabs(["📋 Standard List", "🧩 Clustered Analysis"])
+                
+                with view_tab1:
+                    for i, r in enumerate(results, 1):
+                        score = r["score"]
+                        dot = "🟢" if score > 0.7 else ("🟡" if score > 0.3 else "🟠")
 
-                    st.markdown(f"### {i}. 📄 `{r['doc_id']}`")
-                    st.markdown(f"**🎯 Score:** `{dot} {score:.6f}`")
+                        st.markdown(f"### {i}. 📄 `{r['doc_id']}`")
+                        st.markdown(f"**🎯 Score:** `{dot} {score:.6f}`")
 
-                    if "bm25_rank" in r:
-                        st.caption(f"BM25 rank: {r['bm25_rank']} | BERT rank: {r['bert_rank']}")
+                        if "bm25_rank" in r:
+                            st.caption(f"BM25 rank: {r['bm25_rank']} | BERT rank: {r['bert_rank']}")
 
-                    if show_text and r.get("text"):
-                        st.markdown("**📖 Content:**")
-                        preview = r["text"][:max_text_len]
-                        if len(r["text"]) > max_text_len:
-                            preview += "..."
-                        st.markdown(f"> {preview}")
-                        with st.expander("📚 Full document"):
-                            st.write(r.get("full_text", r["text"]))
+                        if show_text and r.get("text"):
+                            st.markdown("**📖 Content:**")
+                            preview = r["text"][:max_text_len]
+                            if len(r["text"]) > max_text_len:
+                                preview += "..."
+                            st.markdown(f"> {preview}")
+                            with st.expander("📚 Full document"):
+                                st.write(r.get("full_text", r["text"]))
 
-                    if show_matching:
-                        with st.expander("🔍 Matching details"):
-                            _show_matching(r, query, model)
+                        if show_matching:
+                            with st.expander("🔍 Matching details"):
+                                _show_matching(r, last_query, model)
 
-                    st.markdown("---")
+                        st.markdown("---")
+                
+                with view_tab2:
+                    st.subheader("🧩 Clustered View (PCA Projected)")
+                    # Run clustering service
+                    try:
+                        clustering_svc = get_clustering_service()
+                        cluster_results = clustering_svc.cluster_search_results(
+                            results=results,
+                            n_clusters=n_clusters
+                        )
+                        
+                        scatter_data = cluster_results["scatter_data"]
+                        cluster_labels = cluster_results["cluster_labels"]
+                        grouped_results = cluster_results["grouped_results"]
+                        
+                        if scatter_data:
+                            import pandas as pd
+                            import plotly.express as px
+                            
+                            df = pd.DataFrame(scatter_data)
+                            fig = px.scatter(
+                                df,
+                                x="x",
+                                y="y",
+                                color="cluster_label",
+                                hover_data={"doc_id": True, "score": ":.4f", "snippet": True, "x": False, "y": False},
+                                title="2D Document Clusters (PCA)"
+                            )
+                            fig.update_layout(
+                                legend_title_text='Clusters',
+                                xaxis_title="PCA Dimension 1",
+                                yaxis_title="PCA Dimension 2"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Grouped Results Expander
+                            st.markdown("### 📁 Documents by Topic Group")
+                            for cluster_id in sorted(cluster_labels.keys()):
+                                label = cluster_labels[cluster_id]
+                                docs_in_cluster = grouped_results.get(cluster_id, [])
+                                
+                                with st.expander(f"📂 {label} ({len(docs_in_cluster)} documents)", expanded=True):
+                                    for doc in docs_in_cluster:
+                                        col1, col2 = st.columns([4, 1])
+                                        with col1:
+                                            st.markdown(f"**📄 `{doc['doc_id']}`**")
+                                        with col2:
+                                            st.markdown(f"Score: `{doc['score']:.4f}`")
+                                            
+                                        if show_text and doc.get("text"):
+                                            preview = doc["text"][:max_text_len]
+                                            if len(doc["text"]) > max_text_len:
+                                                preview += "..."
+                                            st.markdown(f"> {preview}")
+                                        st.markdown(" ")
+                        else:
+                            st.info("Not enough results to cluster.")
+                    except Exception as e:
+                        st.error(f"Error during clustering: {e}")
+                        import traceback
+                        st.error(traceback.format_exc())
             else:
                 st.warning("⚠️ No results found.")
+
 
         # ── About ─────────────────────────────────────────────────────────────────
         with st.expander("ℹ️ About this system"):
