@@ -103,6 +103,11 @@ class BM25SearchService:
             doc = self.document_store.get_doc(doc_id)
             tokenized_corpus.append(doc.get('tokens', []) if doc else [])
         
+        if not tokenized_corpus:
+            print("⚠️ [BM25SearchService] Warning: tokenized corpus is empty. BM25 model not initialized.")
+            self.bm25 = None
+            return
+
         self.bm25 = BM25Okapi(tokenized_corpus, k1=self._k1, b=self._b)
         print(f"✅ [BM25SearchService] BM25 model built with {len(self.doc_ids)} documents")
 

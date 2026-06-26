@@ -30,6 +30,9 @@ class DocumentStore:
 
     def _get_db_path(self) -> str:
         default_path = 'data/processed/doc_store.db'
+        if os.path.exists(default_path):
+            return default_path
+            
         try:
             abs_path = os.path.abspath(default_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
