@@ -131,22 +131,19 @@ def main():
 
         # ── Query Refinement Options ──────────────────────────────────
         st.markdown("---")
-        st.subheader("🧠 Query Refinement (Optimized)")
+        st.subheader("🧠 Query Formulation Assistance")
 
         use_spelling = st.checkbox("✏️  Spelling Correction", value=True,
-                                   help="Fast correction using pyspellchecker + index validation")
-        use_synonyms = st.checkbox("📚 Synonym Expansion (Index-Filtered)", value=True,
-                                   help="Only adds synonyms that exist in the document collection")
-        use_prf = st.checkbox("🔥 PRF (Smart Filtering)", value=True,
-                               help="Extracts max 3 terms using strict IDF/DF thresholds")
-        use_history = st.checkbox("📜 History Weighting", value=True)
+                                   help="Medical-aware: corrects misspellings but protects gene names (KRAS, BRAF, etc.)")
+        use_prf = st.checkbox("🔥 PRF Expansion", value=True,
+                               help="Adds up to 3 corpus-derived terms from the top BM25 results")
 
         if use_prf:
             num_prf_terms = st.slider("Number of PRF terms", 1, 5, 3)
         else:
             num_prf_terms = 3
 
-        st.caption("⚡ Optimized for speed (< 2s) and relevance (no garbage terms)")
+        st.caption("💡 Query suggestions appear below search results")
 
         # ── Display Options ────────────────────────────────────────────
         st.markdown("---")
@@ -207,9 +204,6 @@ def main():
                 try:
                     refiner = get_refiner()
 
-                    if use_history:
-                        refiner.update_history(query)
-
                     prf_docs = []
                     if use_prf:
                         bm25_temp = get_bm25_service()
@@ -218,12 +212,9 @@ def main():
                     refined = refiner.refine(
                         query=query,
                         apply_spelling=use_spelling,
-                        apply_synonyms=use_synonyms,
                         apply_prf=use_prf,
-                        apply_history=use_history,
                         top_docs=prf_docs,
                         num_prf_terms=num_prf_terms,
-                        synonym_limit=1
                     )
 
                     refined_query = refined['expanded_query']
@@ -247,7 +238,8 @@ def main():
                         svc = get_hybrid_service()
                         svc.k1 = k1
                         svc.b = b
-                        results = svc.search(refined_query, mode="serial", top_k=top_k, bm25_candidates=bm25_candidates)
+                        results = svc.search(refined_query, mode="serial", top_k=top_k,
+                                             bm25_candidates=bm25_candidates, bert_query=query)
                         method_used = f"Hybrid Serial + Refinement"
 
                     elif "Hybrid Parallel" in model:
@@ -255,7 +247,8 @@ def main():
                         svc.k1 = k1
                         svc.b = b
                         results = svc.search(refined_query, mode="parallel", fusion=fusion,
-                                             top_k=top_k, bm25_weight=bm25_w, bert_weight=bert_w)
+                                             top_k=top_k, bm25_weight=bm25_w, bert_weight=bert_w,
+                                             bert_query=query)
                         method_used = f"Hybrid Parallel {fusion.upper()} + Refinement"
 
                     elif "VSM" in model:
@@ -263,8 +256,9 @@ def main():
                         method_used = "VSM TF-IDF + Refinement"
 
                     elif "BERT" in model:
-                        results = get_bert_service().search(refined_query, top_k=top_k)
-                        method_used = "BERT Semantic + Refinement"
+                        # BERT uses the original query — expanded queries dilute the dense embedding
+                        results = get_bert_service().search(query, top_k=top_k)
+                        method_used = "BERT Semantic"
 
                     else:
                         results = get_simple_service().search(refined_query, top_k=top_k)
@@ -287,7 +281,8 @@ def main():
                 "refined_query": refined_query,
                 "refinement_info": refinement_info,
                 "elapsed": elapsed,
-                "query": query
+                "query": query,
+                "prf_docs": prf_docs,
             }
 
         # Check if we have results in session state to display
@@ -298,22 +293,37 @@ def main():
             refinement_info = st.session_state.last_search["refinement_info"]
             elapsed = st.session_state.last_search["elapsed"]
             last_query = st.session_state.last_search["query"]
+            last_prf_docs = st.session_state.last_search.get("prf_docs", [])
 
             if results:
                 st.success(f"✅ {len(results)} results in {elapsed:.3f}s")
                 st.caption(f"📐 Method: {method_used}")
 
-                if use_spelling or use_synonyms or use_prf or use_history:
-                    with st.expander("🧠 Query Refinement Summary", expanded=False):
+                if use_spelling or use_prf:
+                    with st.expander("🧠 Query Formulation Summary", expanded=False):
                         st.write(f"**Original:** `{last_query}`")
-                        st.write(f"**Refined:** `{refined_query}`")
+                        if refined_query != last_query:
+                            st.write(f"**Refined:** `{refined_query}`")
+                        if refinement_info.get('corrections_made'):
+                            st.write(f"**Spelling fixes:** `{refinement_info['corrections_made']}`")
                         if refinement_info.get('prf_terms_added'):
                             st.write(f"**PRF Terms Added:** `{refinement_info['prf_terms_added']}`")
-                        if refinement_info.get('synonyms_added'):
-                            st.write(f"**Synonyms Added:** `{refinement_info['synonyms_added']}`")
-                        if refinement_info.get('history_boost_applied'):
-                            st.write(f"**History Boost:** `{refinement_info['history_boost_applied']}`")
-                        st.write(f"**Final Weights:** `{refinement_info.get('weights', {})}`")
+
+                # ── Query Suggestions ─────────────────────────────────────
+                try:
+                    refiner = get_refiner()
+                    suggestions = refiner.suggest_queries(last_query, top_docs=last_prf_docs or results, n=3)
+                    if suggestions:
+                        st.markdown("**💡 Try also:**")
+                        sug_cols = st.columns(len(suggestions))
+                        for i, sug in enumerate(suggestions):
+                            with sug_cols[i]:
+                                label = sug if len(sug) <= 45 else sug[:42] + "..."
+                                if st.button(f"🔍 {label}", key=f"sug_{i}", use_container_width=True):
+                                    st.session_state.query = sug
+                                    st.rerun()
+                except Exception:
+                    pass
 
                 st.markdown("---")
 
@@ -413,11 +423,21 @@ def main():
         # ── About ─────────────────────────────────────────────────────────────────
         with st.expander("ℹ️ About this system"):
             st.markdown("""
-            ### IR System 2026 – Optimized Query Refinement
-            - **Spelling Correction**: Fast pyspellchecker + vocabulary validation.
-            - **Synonym Expansion**: Only adds synonyms present in the index (max 1 per term).
-            - **PRF**: Extracts max 3 terms using strict DF thresholds (min_df=2, max_df=60%).
-            - **History Weighting**: Additive boost for previously searched terms.
+            ### IR System 2026 – Medical Clinical Trials Search
+
+            **Query Formulation Assistance**
+            - **Spelling Correction**: Medical-aware — protects gene names (KRAS, BRAF, EGFR, etc.)
+              and mutation codes (G12D, V600E) from being "corrected" into common English words.
+            - **PRF Expansion**: Corpus-aware pseudo-relevance feedback. Extracts up to 3 high-IDF
+              terms co-occurring across the top BM25 results. Excludes clinical trial boilerplate.
+
+            **Query Suggestions** (shown after every search)
+            - Suggests alternative phrasings using PRF terms and medical synonyms.
+
+            **BERT & Hybrid models**
+            - BERT always encodes the *original* query (not the PRF-expanded one) so the dense
+              embedding isn't diluted by loosely related PRF terms.
+            - Hybrid modes use the expanded query for BM25 recall and the original for BERT.
             """)
 
     with tab2:

@@ -2,21 +2,16 @@
 """
 Hybrid Search Service — Serial and Parallel modes.
 
-Serial (Sequential):
-    Stage 1: BM25 retrieves top-N candidates
-    Stage 2: BERT re-ranks those candidates by semantic similarity
-    Final score: BERT cosine similarity score
-
-Parallel:
-    Run BM25 + BERT simultaneously on the full index
-    Fuse scores using Reciprocal Rank Fusion (RRF) or Weighted Linear Combination
-    Final score: fused score from both models
+Serial:  BM25 retrieves candidates → BERT re-ranks via weighted combination
+Parallel: BM25 + BERT run independently → Weighted RRF or linear fusion
 """
 
 import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
@@ -35,7 +30,7 @@ class HybridSearchService:
         parallel - BM25 + BERT run simultaneously then scores fused
 
     Fusion methods (parallel only):
-        rrf    - Reciprocal Rank Fusion (rank-based, robust)
+        rrf    - Weighted Reciprocal Rank Fusion (rank-based, robust)
         linear - Weighted linear combination of normalized scores
     """
 
@@ -60,74 +55,103 @@ class HybridSearchService:
         fusion: str = "rrf",
         top_k: int = 10,
         bm25_candidates: int = 100,
-        bm25_weight: float = 0.4,
-        bert_weight: float = 0.6,
+        bm25_weight: float = 0.6,
+        bert_weight: float = 0.4,
+        bert_query: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """
+        Args:
+            query:      Query string (may be BM25-expanded for refinement)
+            bert_query: Original un-expanded query for BERT encoding.
+                        When provided, BERT uses this instead of query so its
+                        embedding stays focused while BM25 benefits from expansion.
+        """
         if not query or not query.strip():
             return []
 
         print(f"\nHybrid Search [{mode.upper()}] query='{query}'")
 
         if mode == "serial":
-            return self._serial_search(query, top_k, bm25_candidates)
+            return self._serial_search(query, top_k, bm25_candidates, bm25_weight, bert_weight, bert_query)
         elif mode == "parallel":
-            return self._parallel_search(query, top_k, fusion, bm25_weight, bert_weight)
+            return self._parallel_search(query, top_k, fusion, bm25_weight, bert_weight, bert_query)
         else:
             raise ValueError(f"Unknown mode '{mode}'. Use 'serial' or 'parallel'.")
 
     # ── Serial ────────────────────────────────────────────────────────────────
 
-    def _serial_search(self, query: str, top_k: int, bm25_candidates: int) -> List[Dict[str, Any]]:
+    def _serial_search(
+        self,
+        query: str,
+        top_k: int,
+        bm25_candidates: int,
+        bm25_weight: float = 0.6,
+        bert_weight: float = 0.4,
+        bert_query: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Stage 1: BM25 retrieves candidates (fast, keyword-based)
-        Stage 2: BERT re-ranks candidates (semantic)
-        Final score: BERT cosine similarity
+        Stage 1: BM25 retrieves a candidate pool larger than top_k.
+        Stage 2: BERT scores all candidates.
+        Final:   Weighted combination of min-max normalized BM25 + BERT scores.
         """
-        print(f"  [Serial] Stage 1: BM25 retrieving {bm25_candidates} candidates...")
-         # Stage 1: BM25 uses QueryProcessor internally (lemmatized tokens)
-        bm25_results = self.bm25.search(query, top_k=bm25_candidates)
+        effective_candidates = max(bm25_candidates, top_k * 2, 150)
+        print(f"  [Serial] Stage 1: BM25 retrieving {effective_candidates} candidates...")
+        bm25_results = self.bm25.search(query, top_k=effective_candidates)
 
         if not bm25_results:
             return []
 
+        bm25_score_map = {r["doc_id"]: r["score"] for r in bm25_results}
         candidate_texts = {
             r["doc_id"]: r.get("full_text", r.get("text", ""))
             for r in bm25_results
         }
 
+        encode_query = bert_query if bert_query else query
         print(f"  [Serial] Stage 2: BERT re-ranking {len(candidate_texts)} candidates...")
-         # Stage 2: BERT receives the RAW query (no preprocessing)
-        # BERT's internal WordPiece tokenizer handles it natively
-        query_vector = self.bert.model.encode(query)
 
-        import numpy as np
-        reranked = []
+        query_vector = self.bert.encode_query(encode_query)
+
+        bert_scores: Dict[str, float] = {}
         for doc_id, text in candidate_texts.items():
-            if not text:
-                continue
-            
-            # Fetch precomputed vector from FAISS vector store
             doc_vector = self.bert.get_vector(doc_id)
             if doc_vector is not None:
-                score = float(np.dot(query_vector, doc_vector))
+                bert_scores[doc_id] = float(np.dot(query_vector, doc_vector))
             else:
-                # Fallback to encoding on the fly if not in FAISS index
-                doc_vector = self.bert.model.encode(text)
-                score = float(np.dot(query_vector, doc_vector))
-                
-            reranked.append((doc_id, score, text))
+                dv = self.bert.model.encode(text) if text else None
+                bert_scores[doc_id] = float(np.dot(query_vector, dv)) if dv is not None else 0.0
 
-        reranked.sort(key=lambda x: x[1], reverse=True)
+        def _minmax(d: Dict[str, float]) -> Dict[str, float]:
+            if not d:
+                return {}
+            lo, hi = min(d.values()), max(d.values())
+            rng = hi - lo
+            return {k: 1.0 for k in d} if rng == 0 else {k: (v - lo) / rng for k, v in d.items()}
+
+        norm_bm25 = _minmax(bm25_score_map)
+        norm_bert  = _minmax(bert_scores)
+        total_w = bm25_weight + bert_weight
+        w_bm25  = bm25_weight / total_w
+        w_bert  = bert_weight  / total_w
+
+        combined = sorted(
+            [
+                (doc_id, w_bm25 * norm_bm25.get(doc_id, 0.0) + w_bert * norm_bert.get(doc_id, 0.0), text)
+                for doc_id, text in candidate_texts.items()
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
 
         results = []
-        for doc_id, score, text in reranked[:top_k]:
+        for doc_id, score, text in combined[:top_k]:
             preview = text[:300] + ("..." if len(text) > 300 else "")
             results.append({
                 "doc_id":    doc_id,
                 "score":     round(score, 6),
                 "text":      preview,
                 "full_text": text,
-                "method":    f"Hybrid Serial (BM25 k1={self.bm25.k1} b={self.bm25.b} -> BERT rerank)",
+                "method":    f"Hybrid Serial (BM25→BERT w={bm25_weight:.1f}/{bert_weight:.1f})",
             })
 
         print(f"  [Serial] Returning {len(results)} results")
@@ -142,18 +166,16 @@ class HybridSearchService:
         fusion: str,
         bm25_weight: float,
         bert_weight: float,
+        bert_query: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        BM25 and BERT run independently and simultaneously.
-        Results fused via RRF or weighted linear combination.
-        """
-        retrieve_k = max(top_k * 3, 50)
+        retrieve_k = max(top_k * 5, 200)
 
-        print(f"  [Parallel] Running BM25...")
+        print(f"  [Parallel] Running BM25 (retrieve_k={retrieve_k})...")
         bm25_results = self.bm25.search(query, top_k=retrieve_k)
 
+        encode_query = bert_query if bert_query else query
         print(f"  [Parallel] Running BERT...")
-        bert_results = self.bert.search(query, top_k=retrieve_k)
+        bert_results = self.bert.search(encode_query, top_k=retrieve_k)
 
         if not bm25_results and not bert_results:
             return []
@@ -165,9 +187,11 @@ class HybridSearchService:
         all_doc_ids = set(bm25_ranks) | set(bert_ranks)
 
         if fusion == "rrf":
-            fused = self._fuse_rrf(all_doc_ids, bm25_ranks, bert_ranks)
+            fused = self._fuse_rrf(all_doc_ids, bm25_ranks, bert_ranks,
+                                   bm25_weight=bm25_weight, bert_weight=bert_weight)
         elif fusion == "linear":
-            fused = self._fuse_linear(all_doc_ids, bm25_scores, bert_scores, bm25_weight, bert_weight)
+            fused = self._fuse_linear(all_doc_ids, bm25_scores, bert_scores,
+                                      bm25_weight, bert_weight)
         else:
             raise ValueError(f"Unknown fusion '{fusion}'. Use 'rrf' or 'linear'.")
 
@@ -187,7 +211,7 @@ class HybridSearchService:
                 "score":     round(score, 6),
                 "text":      preview,
                 "full_text": text,
-                "method":    f"Hybrid Parallel {fusion.upper()} (BM25 k1={self.bm25.k1} b={self.bm25.b} + BERT)",
+                "method":    f"Hybrid Parallel {fusion.upper()} (BM25 + BERT)",
                 "bm25_rank": bm25_ranks.get(doc_id, "-"),
                 "bert_rank": bert_ranks.get(doc_id, "-"),
             })
@@ -197,41 +221,49 @@ class HybridSearchService:
 
     # ── Fusion methods ────────────────────────────────────────────────────────
 
-    def _fuse_rrf(self, doc_ids: set, bm25_ranks: Dict[str, int], bert_ranks: Dict[str, int], k: int = RRF_K) -> List[Tuple[str, float]]:
-        """
-        Reciprocal Rank Fusion.
-        score(d) = 1/(k + rank_bm25(d)) + 1/(k + rank_bert(d))
-        Missing docs get penalty rank = max_rank + 1
-        """
-        max_rank = max(max(bm25_ranks.values(), default=0), max(bert_ranks.values(), default=0)) + 1
-        fused = []
-        for doc_id in doc_ids:
-            score = (1.0 / (k + bm25_ranks.get(doc_id, max_rank))) + \
-                    (1.0 / (k + bert_ranks.get(doc_id, max_rank)))
-            fused.append((doc_id, score))
-        return fused
+    def _fuse_rrf(
+        self,
+        doc_ids: set,
+        bm25_ranks: Dict[str, int],
+        bert_ranks: Dict[str, int],
+        k: int = RRF_K,
+        bm25_weight: float = 1.0,
+        bert_weight: float = 1.0,
+    ) -> List[Tuple[str, float]]:
+        max_rank = max(
+            max(bm25_ranks.values(), default=0),
+            max(bert_ranks.values(), default=0),
+        ) + 1
+        return [
+            (
+                doc_id,
+                (bm25_weight / (k + bm25_ranks.get(doc_id, max_rank))) +
+                (bert_weight  / (k + bert_ranks.get(doc_id,  max_rank))),
+            )
+            for doc_id in doc_ids
+        ]
 
-    def _fuse_linear(self, doc_ids: set, bm25_scores: Dict[str, float], bert_scores: Dict[str, float], bm25_weight: float, bert_weight: float) -> List[Tuple[str, float]]:
-        """
-        Weighted Linear Combination with min-max normalization.
-        score(d) = w_bm25 * norm(bm25(d)) + w_bert * norm(bert(d))
-        """
+    def _fuse_linear(
+        self,
+        doc_ids: set,
+        bm25_scores: Dict[str, float],
+        bert_scores: Dict[str, float],
+        bm25_weight: float,
+        bert_weight: float,
+    ) -> List[Tuple[str, float]]:
         def minmax(scores):
             if not scores:
                 return {}
             lo, hi = min(scores.values()), max(scores.values())
             rng = hi - lo
-            if rng == 0:
-                return {k: 1.0 for k in scores}
-            return {k: (v - lo) / rng for k, v in scores.items()}
+            return {k: 1.0 for k in scores} if rng == 0 else {k: (v - lo) / rng for k, v in scores.items()}
 
         n_bm25 = minmax(bm25_scores)
-        n_bert = minmax(bert_scores)
-        fused  = []
-        for doc_id in doc_ids:
-            score = bm25_weight * n_bm25.get(doc_id, 0.0) + bert_weight * n_bert.get(doc_id, 0.0)
-            fused.append((doc_id, score))
-        return fused
+        n_bert  = minmax(bert_scores)
+        return [
+            (doc_id, bm25_weight * n_bm25.get(doc_id, 0.0) + bert_weight * n_bert.get(doc_id, 0.0))
+            for doc_id in doc_ids
+        ]
 
     # ── BM25 parameter passthrough ────────────────────────────────────────────
 

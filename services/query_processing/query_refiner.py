@@ -1,408 +1,338 @@
 """
-Query Refinement Service – 4-Stage Pipeline (Optimized)
-1. Fast Spelling Correction
-2. Context-Filtered Synonym Expansion
-3. Pseudo-Relevance Feedback (PRF)
-4. Personalized History Weighting
+Query Refinement Service — Medical IR (ClinicalTrials)
+
+Two public capabilities:
+  refine()         → Query formulation assistance: spelling + PRF
+  suggest_queries() → Query suggestion: alternative phrasings for the UI
+
+Design decisions:
+- Synonym expansion removed from refine(): even with a curated medical thesaurus
+  the substring matching was adding unrelated synonyms and hurting MAP.
+  PRF is strictly better — it uses terms that actually co-occur in retrieved docs.
+- QuerySegmenter removed: stripping "38-year-old male" from a TREC PM query
+  removes eligibility-matching terms, hurting recall on clinical trial retrieval.
+- Token repetition removed: repeating base tokens 3× makes queries artificially
+  long and confuses BM25's term-frequency scoring.
 """
 
 import re
 import os
 import pickle
 from math import log
-from typing import List, Dict, Set, Optional, Any
+from typing import List, Dict, Set, Optional, Any, Tuple
 from collections import Counter
 
 from spellchecker import SpellChecker
-from nltk.corpus import wordnet
-from nltk import pos_tag
 from nltk.tokenize import word_tokenize
 
 from services.query_processing.query_processor import QueryProcessor
-from services.preprocessing.preprocessor import get_wordnet_pos
 
+
+# ── Medical thesaurus (kept for suggest_queries only) ─────────────────────────
+
+MEDICAL_THESAURUS: Dict[str, List[str]] = {
+    'cancer':           ['carcinoma', 'malignancy', 'neoplasm'],
+    'breast cancer':    ['breast carcinoma', 'mammary cancer'],
+    'lung cancer':      ['pulmonary carcinoma', 'lung carcinoma'],
+    'colorectal cancer':['colon cancer', 'rectal cancer', 'colorectal carcinoma'],
+    'pancreatic cancer':['pancreatic carcinoma', 'pancreas cancer'],
+    'liver cancer':     ['hepatocellular carcinoma', 'hepatic cancer'],
+    'melanoma':         ['malignant melanoma', 'cutaneous melanoma'],
+    'leukemia':         ['leukaemia', 'haematological malignancy'],
+    'lymphoma':         ['lymphatic cancer', 'lymphatic malignancy'],
+    'tumor':            ['neoplasm', 'lesion', 'mass'],
+    'metastasis':       ['metastatic disease', 'secondary tumor'],
+    'mutation':         ['variant', 'alteration', 'gene mutation'],
+    'amplification':    ['gene amplification', 'copy number gain'],
+    'HER2':             ['ERBB2', 'HER2/neu'],
+    'EGFR':             ['epidermal growth factor receptor', 'ERBB1'],
+    'KRAS':             ['K-Ras', 'KRAS mutation'],
+    'BRAF':             ['BRAF mutation', 'BRAF V600E'],
+    'BRCA1':            ['breast cancer gene 1', 'BRCA1 mutation'],
+    'BRCA2':            ['breast cancer gene 2', 'BRCA2 mutation'],
+    'chemotherapy':     ['cytotoxic therapy', 'antineoplastic therapy'],
+    'immunotherapy':    ['immune therapy', 'biological therapy'],
+    'hypertension':     ['high blood pressure', 'HTN'],
+    'diabetes':         ['diabetes mellitus', 'DM'],
+}
+
+# Clinical trial boilerplate to exclude from PRF
+_PRF_EXCLUDED = {
+    'patient', 'patients', 'study', 'studies', 'trial', 'trials', 'clinical',
+    'treatment', 'therapy', 'therapeutic', 'evaluable', 'assessed', 'enrolled',
+    'eligibility', 'criteria', 'inclusion', 'exclusion', 'date', 'group', 'groups',
+    'daily', 'dose', 'doses', 'week', 'weeks', 'month', 'months', 'year', 'years',
+    'day', 'days', 'history', 'diagnosed', 'diagnosis', 'active', 'prior',
+    'receive', 'receiving', 'efficacy', 'safety', 'associated', 'results',
+}
+
+# Protected gene/mutation tokens — never spell-correct these
+_PROTECTED_GENES = {
+    'kras', 'braf', 'cdk4', 'nf2', 'akt1', 'fgfr1', 'pten', 'cdkn2a', 'nras',
+    'egfr', 'eml4', 'alk', 'kit', 'pik3ca', 'brca2', 'idh1', 'stk11', 'cdk6',
+    'mdm2', 'met', 'tp53', 'erbb3', 'erbb2', 'brca1', 'rb1',
+}
+
+
+# ── Sub-service: Medical-aware spelling correction ────────────────────────────
+
+class MedicalSpeller:
+    """
+    Corrects misspelled tokens while protecting gene names, mutation codes,
+    uppercase abbreviations, and numbers from being "corrected" into common
+    English words (e.g., KRAS must never become "grass").
+    """
+
+    def __init__(self, known_terms: Set[str], spell_checker: SpellChecker):
+        self.known_terms = known_terms
+        self.spell_checker = spell_checker
+
+    def _should_protect(self, token: str) -> bool:
+        if any(c.isdigit() for c in token):
+            return True
+        if any(c.isupper() for c in token):
+            return True
+        if len(token) < 3:
+            return True
+        if token.lower() in _PROTECTED_GENES:
+            return True
+        return False
+
+    def correct(self, query: str) -> Tuple[str, List[Tuple[str, str]]]:
+        tokens = word_tokenize(query)
+        out, fixes = [], []
+        for tok in tokens:
+            if self._should_protect(tok) or tok.lower() in self.known_terms:
+                out.append(tok)
+                continue
+            candidate = self.spell_checker.correction(tok)
+            if candidate and candidate.lower() != tok.lower() and candidate.lower() in self.known_terms:
+                out.append(candidate.capitalize() if tok[0].isupper() else candidate)
+                fixes.append((tok, candidate))
+            else:
+                out.append(tok)
+        corrected = " ".join(out)
+        corrected = re.sub(r'\s+([,\).])', r'\1', corrected)
+        corrected = re.sub(r'(\()\s+', r'\1', corrected)
+        return corrected, fixes
+
+
+# ── Sub-service: Corpus-aware PRF ────────────────────────────────────────────
+
+class MedicalPRF:
+    """
+    Pseudo-Relevance Feedback using corpus IDF scores.
+    Extracts high-value terms from top-retrieved documents,
+    excluding clinical-trial boilerplate and boosting gene/mutation-like tokens.
+    """
+
+    def __init__(self, preprocessor, term_frequencies: Dict[str, int], total_docs: int):
+        self.preprocessor = preprocessor
+        self.term_frequencies = term_frequencies
+        self.total_docs = total_docs
+
+    def extract_terms(
+        self,
+        top_docs: List[Dict],
+        original_tokens: List[str],
+        num_terms: int = 3,
+    ) -> List[str]:
+        if not top_docs or len(top_docs) < 2:
+            return []
+
+        original_set = {t.lower() for t in original_tokens}
+        term_doc_count: Counter = Counter()
+        doc_term_freqs: List[Counter] = []
+
+        for doc in top_docs[:5]:
+            text = doc.get("full_text") or doc.get("text") or ""
+            if not text:
+                continue
+            tokens = self.preprocessor.process(text)
+            if not tokens:
+                continue
+            filtered = [
+                t for t in tokens
+                if t.lower() not in original_set
+                and t.lower() not in _PRF_EXCLUDED
+                and len(t) >= 3
+            ]
+            if not filtered:
+                continue
+            tf = Counter(filtered)
+            doc_term_freqs.append(tf)
+            for term in set(filtered):
+                term_doc_count[term] += 1
+
+        if not doc_term_freqs:
+            return []
+
+        N = len(doc_term_freqs)
+        min_df = 2
+        max_df = max(int(N * 0.7), 2)
+        scores: Dict[str, float] = {}
+
+        for term, df in term_doc_count.items():
+            if df < min_df or df > max_df:
+                continue
+            coll_df = self.term_frequencies.get(term, df)
+            idf = log((self.total_docs + 1) / (coll_df + 1))
+            boost = 2.5 if (any(c.isupper() for c in term) or any(c.isdigit() for c in term)) else 1.0
+            total_tf = sum(tf.get(term, 0) for tf in doc_term_freqs)
+            scores[term] = total_tf * idf * boost
+
+        return [t for t, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:num_terms]]
+
+
+# ── Main orchestrator ─────────────────────────────────────────────────────────
 
 class QueryRefiner:
+    """
+    Medical query refinement with two public capabilities:
+
+    1. refine()         — formulation assistance: spelling + PRF
+    2. suggest_queries() — query suggestion: clickable alternative queries for the UI
+
+    Legacy parameters (apply_synonyms, apply_history, apply_profile, synonym_limit)
+    are accepted but silently ignored so existing callers don't break.
+    """
 
     def __init__(
         self,
         known_terms: Optional[Set[str]] = None,
         term_frequencies: Optional[Dict[str, int]] = None,
-        total_docs: int = 0
+        total_docs: int = 0,
+        **kwargs,          # absorbs unused legacy params (model_name, etc.)
     ):
-        """
-        Parameters
-        ----------
-        known_terms
-            Vocabulary extracted from inverted index
-        term_frequencies
-            Document frequency of each term
-        total_docs
-            Total documents in collection
-        """
-        print("🔧 Initializing QueryRefiner...")
-
+        print("Initializing QueryRefiner...")
         self.query_processor = QueryProcessor()
         self.preprocessor = self.query_processor.preprocessor
-
-        self.spell_checker = SpellChecker()
-
         self.stopwords = self.preprocessor.stop_words
 
         self.known_terms = known_terms or set()
         self.term_frequencies = term_frequencies or {}
-
         self.total_docs = max(total_docs, 1)
 
-        self.user_history_terms: Dict[str, float] = {}
+        self.spell_checker = SpellChecker()
+        self.speller = MedicalSpeller(self.known_terms, self.spell_checker)
+        self.prf_service = MedicalPRF(self.preprocessor, self.term_frequencies, self.total_docs)
 
-        print(
-            f"✅ QueryRefiner Ready "
-            f"(Terms={len(self.known_terms):,}, Docs={self.total_docs:,})"
-        )
+        # Lightweight history for UI session (term counts only, no SBERT)
+        self.user_history_terms: Dict[str, int] = {}
 
-    # ============================================================
-    # STAGE 1
-    # SPELLING CORRECTION
-    # ============================================================
+        print(f"QueryRefiner ready — vocab={len(self.known_terms):,} docs={self.total_docs:,}")
 
-    def correct_spelling(self, query: str) -> str:
-        raw_tokens = word_tokenize(query)
-        corrected_tokens = []
-
-        for token in raw_tokens:
-            if (
-                token.lower() in self.known_terms
-            ):
-                corrected_tokens.append(token)
-                continue
-
-            if (
-                not re.match(r'^[a-zA-Z]+$', token)
-                or len(token) < 3
-            ):
-                corrected_tokens.append(token)
-                continue
-
-            candidate = self.spell_checker.correction(token)
-
-            if (
-                candidate
-                and candidate != token
-            ):
-                if (
-                    self.known_terms
-                    and candidate.lower() in self.known_terms
-                ):
-                    if token[0].isupper():
-                        candidate = candidate.capitalize()
-                    corrected_tokens.append(candidate)
-                else:
-                    corrected_tokens.append(token)
-            else:
-                corrected_tokens.append(token)
-
-        return " ".join(corrected_tokens)
-
-    # ============================================================
-    # STAGE 2
-    # SYNONYM EXPANSION
-    # ============================================================
-
-    def expand_synonyms(
-        self,
-        tokens: List[str],
-        max_synonyms: int = 2
-    ) -> List[str]:
-        expanded = list(tokens)
-
-        if not tokens:
-            return expanded
-
-        if not self.known_terms:
-            return expanded
-
-        try:
-            tagged_tokens = pos_tag(tokens)
-        except Exception:
-            tagged_tokens = [(t, "NN") for t in tokens]
-
-        expanded_lower = {t.lower() for t in expanded}
-
-        BLOCKED_SYNONYM_TOKENS = {
-            'cancer', 'tumor', 'tumour', 'disease', 'none', 'male', 'female', 
-            'patient', 'patients', 'year', 'yearold', 'month', 'monthold', 
-            'day', 'dayold', 'old', 'age', 'history', 'symptom', 'symptoms',
-            'therapy', 'treatment', 'inactivating', 'inactivate', 'active',
-            'activation', 'amplification', 'amplify', 'loss', 'gain', 'mutation',
-            'mutate', 'mutated', 'variant', 'gene', 'protein', 'receptor',
-            'kinase', 'inhibitor', 'blocker', 'depression', 'hypertension',
-            'diabetes'
-        }
-
-        for token, pos in tagged_tokens:
-            if token.lower() in BLOCKED_SYNONYM_TOKENS:
-                continue
-            wn_pos = get_wordnet_pos(pos) or wordnet.NOUN
-            synsets = wordnet.synsets(token, pos=wn_pos)
-            added = 0
-
-            for synset in synsets:
-                if added >= max_synonyms:
-                    break
-
-                for lemma in synset.lemmas():
-                    synonym = lemma.name().replace("_", " ")
-
-                    if (
-                        synonym.lower() == token.lower()
-                        or synonym.lower() in self.stopwords
-                        or len(synonym) < 3
-                        or len(synonym) > 25
-                        or len(synonym.split()) > 2
-                        or not re.match(r'^[a-zA-Z\s]+$', synonym)
-                    ):
-                        continue
-
-                    df = self.term_frequencies.get(synonym.lower(), 0)
-
-                    if (
-                        synonym.lower() in self.known_terms
-                        and synonym.lower() not in expanded_lower
-                        and df >= 5
-                    ):
-                        expanded.append(synonym)
-                        expanded_lower.add(synonym.lower())
-                        added += 1
-                        break
-
-        return expanded
-
-    # ============================================================
-    # STAGE 3
-    # PSEUDO RELEVANCE FEEDBACK
-    # ============================================================
-
-    def extract_prf_terms(
-        self,
-        top_docs: List[Dict],
-        original_tokens: List[str],
-        num_terms: int = 3
-    ) -> List[str]:
-        if not top_docs:
-            return []
-
-        if len(top_docs) < 2:
-            return []
-
-        N = min(len(top_docs), 5)
-
-        doc_term_freqs = []
-        term_doc_count = Counter()
-
-        for doc in top_docs[:5]:
-            text = doc.get("full_text", doc.get("text", ""))
-            if not text:
-                continue
-
-            tokens = self.preprocessor.process(text)
-            if not tokens:
-                continue
-
-            tf_counter = Counter(tokens)
-            doc_term_freqs.append(tf_counter)
-
-            for term in set(tokens):
-                if term not in self.stopwords and len(term) > 2:
-                    term_doc_count[term] += 1
-
-        if not doc_term_freqs:
-            return []
-
-        scores = {}
-        original_set = set(original_tokens)
-
-        min_df = 2
-        max_df = max(int(N * 0.8), 2)
-
-        for term, df in term_doc_count.items():
-            if term in original_set:
-                continue
-
-            if df < min_df:
-                continue
-
-            if df > max_df:
-                continue
-
-            collection_df = self.term_frequencies.get(term, df)
-
-            idf = log((self.total_docs + 1) / (collection_df + 1))
-
-            total_tf = sum(tf.get(term, 0) for tf in doc_term_freqs)
-
-            scores[term] = total_tf * idf
-
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-        return [term for term, _ in ranked[:num_terms]]
-
-    # ============================================================
-    # STAGE 4
-    # HISTORY
-    # ============================================================
-
-    def update_history(self, query: str):
-        tokens = self.preprocessor.process(query)
-
-        for token in tokens:
-            if len(token) > 2 and token not in self.stopwords:
-                self.user_history_terms[token] = self.user_history_terms.get(token, 0) + 1
-
-    def get_history_weights(self, tokens: List[str]) -> Dict[str, float]:
-        weights = {}
-
-        for token in tokens:
-            if token in self.user_history_terms:
-                weights[token] = log(1 + self.user_history_terms[token])
-
-        return weights
-
-    # ============================================================
-    # MAIN ORCHESTRATOR
-    # ============================================================
+    # ── Formulation assistance ────────────────────────────────────────────────
 
     def refine(
         self,
         query: str,
-        apply_spelling: bool = True,
-        apply_synonyms: bool = True,
-        apply_prf: bool = True,
-        apply_history: bool = True,
         top_docs: Optional[List[Dict]] = None,
+        apply_spelling: bool = True,
+        apply_prf: bool = True,
         num_prf_terms: int = 3,
-        synonym_limit: int = 2
+        # Legacy params — accepted but ignored
+        apply_synonyms: bool = False,
+        apply_history: bool = False,
+        apply_profile: bool = False,
+        synonym_limit: int = 0,
+        **kwargs,
     ) -> Dict[str, Any]:
-        print(f"\n🔧 Refining query: {query}")
+        """
+        Query formulation assistance.
 
+        Steps:
+          1. Spelling correction (medical-aware: protects genes/mutations)
+          2. PRF expansion from top-retrieved documents (corpus-aware)
+
+        Returns expanded_query = corrected_tokens + prf_terms (one occurrence each).
+        Pass apply_prf=False for BERT to avoid embedding dilution.
+        """
         current_query = query
+        corrections_made: List[Tuple[str, str]] = []
 
         if apply_spelling:
-            current_query = self.correct_spelling(current_query)
-            print(f"   ✏️ Spelling: '{query}' → '{current_query}'")
-
-        result = {
-            "original": query,
-            "corrected": current_query,
-            "tokens": [],
-            "weights": {},
-            "expanded_query": "",
-            "prf_terms_added": [],
-            "synonyms_added": [],
-            "history_boost_applied": {}
-        }
+            current_query, corrections_made = self.speller.correct(current_query)
 
         base_tokens = self.preprocessor.process(current_query)
+        prf_terms: List[str] = []
 
-        if not base_tokens:
-            result["expanded_query"] = current_query
-            return result
+        if apply_prf and top_docs and base_tokens:
+            prf_terms = self.prf_service.extract_terms(top_docs, base_tokens, num_terms=num_prf_terms)
 
-        final_tokens = list(base_tokens)
+        final_tokens = base_tokens + [t for t in prf_terms if t not in base_tokens]
+        expanded_query = " ".join(final_tokens) if final_tokens else current_query
 
-        # -------------------------
-        # Synonyms
-        # -------------------------
-        synonyms_added = []
+        return {
+            "original":              query,
+            "corrected":             current_query,
+            "expanded_query":        expanded_query,
+            "prf_terms_added":       prf_terms,
+            "corrections_made":      corrections_made,
+            # Legacy keys kept for UI/evaluate.py compatibility
+            "tokens":                final_tokens,
+            "weights":               {},
+            "synonyms_added":        [],
+            "history_boost_applied": {},
+        }
 
-        if apply_synonyms:
-            expanded_tokens = self.expand_synonyms(base_tokens, max_synonyms=synonym_limit)
-            base_set = set(base_tokens)
+    # ── Query suggestion ──────────────────────────────────────────────────────
 
-            for token in expanded_tokens:
-                if token not in base_set and token not in final_tokens:
-                    final_tokens.append(token)
-                    synonyms_added.append(token)
+    def suggest_queries(
+        self,
+        query: str,
+        top_docs: Optional[List[Dict]] = None,
+        n: int = 3,
+    ) -> List[str]:
+        """
+        Generate up to n alternative query suggestions for the UI.
 
-        # -------------------------
-        # PRF
-        # -------------------------
-        prf_terms = []
+        Sources (in priority order):
+          1. PRF terms — different subsets give different search angles
+          2. Medical thesaurus — replace a key term with a clinical synonym
 
-        if apply_prf and top_docs:
-            prf_terms = self.extract_prf_terms(top_docs, base_tokens, num_terms=num_prf_terms)
+        Each suggestion is a complete query string ready to paste into the search box.
+        """
+        base_tokens = self.preprocessor.process(query)
+        suggestions: List[str] = []
 
-            for token in prf_terms:
-                if token not in final_tokens:
-                    final_tokens.append(token)
+        # 1. PRF-based suggestions (need top_docs)
+        if top_docs and len(top_docs) >= 2 and base_tokens:
+            candidates = self.prf_service.extract_terms(
+                top_docs, base_tokens, num_terms=n * 2
+            )
+            for term in candidates:
+                if len(suggestions) >= n:
+                    break
+                suggestions.append(f"{query} {term}")
 
-        # -------------------------
-        # History
-        # -------------------------
-        history_boost = {}
+        # 2. Thesaurus-based suggestions (fill remaining slots)
+        if len(suggestions) < n:
+            for token in base_tokens:
+                if len(suggestions) >= n:
+                    break
+                alts = MEDICAL_THESAURUS.get(token.lower()) or MEDICAL_THESAURUS.get(token)
+                if not alts:
+                    continue
+                # Replace the token with the first thesaurus alternative
+                alt = alts[0]
+                pattern = re.compile(re.escape(token), re.IGNORECASE)
+                new_query = pattern.sub(alt, query, count=1)
+                if new_query.lower() != query.lower():
+                    suggestions.append(new_query)
 
-        if apply_history and self.user_history_terms:
-            history_boost = self.get_history_weights(base_tokens)
+        return suggestions[:n]
 
-        # -------------------------
-        # Build Weights
-        # -------------------------
-        weights = {token: 1.0 for token in final_tokens}
+    # ── History (lightweight, UI-only) ────────────────────────────────────────
 
-        for token, boost in history_boost.items():
-            weights[token] = weights.get(token, 1.0) + boost
-
-        for token in prf_terms:
-            if token in weights:
-                weights[token] *= 0.6
-
-        for token in synonyms_added:
-            if token in weights:
-                weights[token] *= 0.3
-
-        for token in base_tokens:
-            weights[token] = max(weights.get(token, 1.0), 1.0)
-
-        # -------------------------
-        # Weighted Query Expansion
-        # -------------------------
-        weighted_tokens = []
-
-        for token in final_tokens:
-            weight = weights.get(token, 1.0)
-
-            if weight >= 2.5:
-                repeats = 3
-            elif weight >= 1.5:
-                repeats = 2
-            else:
-                repeats = 1
-
-            weighted_tokens.extend([token] * repeats)
-
-        expanded_query = " ".join(weighted_tokens)
-
-        result["tokens"] = final_tokens
-        result["weights"] = weights
-        result["expanded_query"] = expanded_query
-        result["prf_terms_added"] = prf_terms
-        result["synonyms_added"] = synonyms_added
-        result["history_boost_applied"] = history_boost
-
-        print(f"   📚 Synonyms: {synonyms_added}")
-        print(f"   🔥 PRF: {prf_terms}")
-        print(f"   📜 History: {history_boost}")
-        print(f"   ✅ Tokens: {final_tokens}")
-
-        return result
-
-    # ============================================================
-    # SAVE / LOAD HISTORY
-    # ============================================================
+    def update_history(self, query: str, results: Optional[List[Dict]] = None):
+        tokens = self.preprocessor.process(query)
+        for t in tokens:
+            if len(t) > 2 and t not in self.stopwords:
+                self.user_history_terms[t] = self.user_history_terms.get(t, 0) + 1
 
     def save_history(self, path: str = "data/user_history.pkl"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-
         with open(path, "wb") as f:
             pickle.dump(self.user_history_terms, f)
 
@@ -410,3 +340,12 @@ class QueryRefiner:
         if os.path.exists(path):
             with open(path, "rb") as f:
                 self.user_history_terms = pickle.load(f)
+            return True
+        return False
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "known_terms": len(self.known_terms),
+            "total_docs":  self.total_docs,
+            "history_len": len(self.user_history_terms),
+        }

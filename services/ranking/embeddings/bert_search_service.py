@@ -67,8 +67,19 @@ class BERTSearchService:
 
     def _initialize(self, force_rebuild: bool) -> None:
         if not force_rebuild and os.path.exists(_VECTOR_STORE_PATH):
-            self._load_index()
-            self.total_docs = self.vector_store.total if self.vector_store else 0
+            try:
+                self._load_index()
+                self.total_docs = self.vector_store.total if self.vector_store else 0
+            except (MemoryError, Exception) as e:
+                print(f"⚠️ [BERTSearchService] MemoryError or Exception loading FAISS index: {e}.")
+                print("   Falling back to on-the-fly SBERT encoding for search results.")
+                self.vector_store = None
+                self.total_docs = 0
+            except BaseException as be:
+                print(f"⚠️ [BERTSearchService] Critical system error loading FAISS index: {be}.")
+                print("   Falling back to on-the-fly SBERT encoding for search results.")
+                self.vector_store = None
+                self.total_docs = 0
         else:
             print("🔨 Building BERT index from scratch...")
             docs = self._load_processed_documents()
@@ -162,6 +173,13 @@ class BERTSearchService:
         if self.vector_store:
             return self.vector_store.get_vector(doc_id)
         return None
+
+    def encode_query(self, query: str) -> np.ndarray:
+        """
+        Encode a query string into a vector.
+        """
+        return self.model.encode(query)
+
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """

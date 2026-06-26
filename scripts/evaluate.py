@@ -106,24 +106,47 @@ def main():
         print("\n⚠️  No evaluable queries — cannot continue.")
         return
 
-    # ── Helper search function with refinement ──────────────────────────────
+    # ── Helper search functions ────────────────────────────────────────────────
+
     def refined_search(search_fn, q, k):
-        # 1. PRF Docs using BM25
+        """BM25/VSM refinement: spelling + PRF expansion."""
         prf_docs = bm25_svc.search(q, top_k=5)
-        # 2. Refine query
         refined = refiner.refine(
             query=q,
             apply_spelling=True,
-            apply_synonyms=True,
             apply_prf=True,
-            apply_history=False,  # disabled for batch evaluation consistency
             top_docs=prf_docs,
             num_prf_terms=3,
-            synonym_limit=1
         )
-        refined_q = refined["expanded_query"]
-        # 3. Execute search on refined query
-        return search_fn(refined_q, k)
+        return search_fn(refined["expanded_query"], k)
+
+    def refined_bert_search(search_fn, q, k):
+        """BERT refinement: spelling only (no PRF — expansion dilutes dense embeddings)."""
+        refined = refiner.refine(query=q, apply_spelling=True, apply_prf=False)
+        return search_fn(refined["expanded_query"], k)
+
+    def refined_hybrid_search(q, k, mode, bm25_candidates=300, fusion="rrf",
+                               bm25_weight=0.6, bert_weight=0.4):
+        """Hybrid refinement: BM25 uses the PRF-expanded query for recall;
+        BERT receives the original query to preserve embedding quality."""
+        prf_docs = bm25_svc.search(q, top_k=5)
+        refined = refiner.refine(
+            query=q,
+            apply_spelling=True,
+            apply_prf=True,
+            top_docs=prf_docs,
+            num_prf_terms=3,
+        )
+        return hybrid_svc.search(
+            refined["expanded_query"],
+            mode=mode,
+            fusion=fusion,
+            top_k=k,
+            bm25_candidates=bm25_candidates,
+            bm25_weight=bm25_weight,
+            bert_weight=bert_weight,
+            bert_query=q,   # original query for BERT — not expanded
+        )
 
     # ── Run evaluation ────────────────────────────────────────────────────────
     all_results = {}
@@ -161,41 +184,50 @@ def main():
     )
     all_results["BERT (Baseline)"] = agg_base
 
+    # BERT refinement: only spelling correction avoids embedding dilution
     agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_search(lambda rq, rk: bert_svc.search(rq, top_k=rk), q, k),
+        search_fn=lambda q, k: refined_bert_search(lambda rq, rk: bert_svc.search(rq, top_k=rk), q, k),
         top_k=TOP_K, max_queries=MAX_QUERIES, label="BERT (+ Refinement)"
     )
     all_results["BERT (+ Refinement)"] = agg_enh
 
     # 4. Hybrid Serial
+    # bm25_candidates=300 > top_k=100 so BERT has a larger pool to reorder;
+    # bm25_weight=0.6 because BM25 outperforms BERT on this medical corpus.
     agg_base, _ = eval_svc.evaluate(
         search_fn=lambda q, k: hybrid_svc.search(
-            q, mode="serial", top_k=k, bm25_candidates=100
+            q, mode="serial", top_k=k, bm25_candidates=300,
+            bm25_weight=0.6, bert_weight=0.4,
         ),
         top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Serial (Baseline)"
     )
     all_results["Hybrid Serial (Baseline)"] = agg_base
 
     agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_search(
-            lambda rq, rk: hybrid_svc.search(rq, mode="serial", top_k=rk, bm25_candidates=100), q, k
+        search_fn=lambda q, k: refined_hybrid_search(
+            q, k, mode="serial", bm25_candidates=300,
+            bm25_weight=0.6, bert_weight=0.4,
         ),
         top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Serial (+ Refinement)"
     )
     all_results["Hybrid Serial (+ Refinement)"] = agg_enh
 
     # 5. Hybrid Parallel RRF
+    # Weighted RRF: BM25 weight 1.5 vs BERT weight 0.5 because BM25 is stronger
+    # on domain-specific medical text; equal weights let BERT pollute top results.
     agg_base, _ = eval_svc.evaluate(
         search_fn=lambda q, k: hybrid_svc.search(
-            q, mode="parallel", fusion="rrf", top_k=k
+            q, mode="parallel", fusion="rrf", top_k=k,
+            bm25_weight=1.5, bert_weight=0.5,
         ),
         top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Parallel RRF (Baseline)"
     )
     all_results["Hybrid Parallel RRF (Baseline)"] = agg_base
 
     agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_search(
-            lambda rq, rk: hybrid_svc.search(rq, mode="parallel", fusion="rrf", top_k=rk), q, k
+        search_fn=lambda q, k: refined_hybrid_search(
+            q, k, mode="parallel", fusion="rrf",
+            bm25_weight=1.5, bert_weight=0.5,
         ),
         top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Parallel RRF (+ Refinement)"
     )
