@@ -7,6 +7,7 @@ import streamlit as st
 import sys
 import os
 import time
+import json
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -155,168 +156,174 @@ def main():
             st.rerun()
 
     # ── Query area ────────────────────────────────────────────────────────────
-    st.header("📝 Enter your search query")
+    tab1, tab2 = st.tabs(["🔍 Search Engine", "📊 System Evaluation"])
 
-    examples = [
-        "Liposarcoma CDK4 Amplification",
-        "Colon cancer KRAS BRAF",
-        "Meningioma NF2 AKT1",
-        "Melanoma BRAF CDKN2A"
-    ]
-    cols = st.columns(len(examples))
-    for i, ex in enumerate(examples):
-        with cols[i]:
-            if st.button(f"🔍 {ex}", key=f"ex_{i}"):
-                st.session_state.query = ex
+    with tab1:
+        st.header("📝 Enter your search query")
 
-    query = st.text_input("Search query:", value=st.session_state.get("query", ""),
-                          placeholder="e.g., Colon cancer KRAS (G13D)...",
-                          label_visibility="collapsed")
+        examples = [
+            "Liposarcoma CDK4 Amplification",
+            "Colon cancer KRAS BRAF",
+            "Meningioma NF2 AKT1",
+            "Melanoma BRAF CDKN2A"
+        ]
+        cols = st.columns(len(examples))
+        for i, ex in enumerate(examples):
+            with cols[i]:
+                if st.button(f"🔍 {ex}", key=f"ex_{i}"):
+                    st.session_state.query = ex
 
-    c1, c2, c3 = st.columns([1, 1, 4])
-    with c1:
-        search_btn = st.button("🔍 Search", type="primary", use_container_width=True)
+        query = st.text_input("Search query:", value=st.session_state.get("query", ""),
+                              placeholder="e.g., Colon cancer KRAS (G13D)...",
+                              label_visibility="collapsed")
 
-    # ── Search ────────────────────────────────────────────────────────────────
-    if search_btn and query:
-        t0 = time.time()
-        results = []
-        method_used = model
-        refined_query = query
-        refinement_info = {}
+        c1, c2, c3 = st.columns([1, 1, 4])
+        with c1:
+            search_btn = st.button("🔍 Search", type="primary", use_container_width=True)
 
-        with st.spinner("🔍 Searching..."):
-            try:
-                refiner = get_refiner()
+        # ── Search ────────────────────────────────────────────────────────────────
+        if search_btn and query:
+            t0 = time.time()
+            results = []
+            method_used = model
+            refined_query = query
+            refinement_info = {}
 
-                if use_history:
-                    refiner.update_history(query)
+            with st.spinner("🔍 Searching..."):
+                try:
+                    refiner = get_refiner()
 
-                prf_docs = []
-                if use_prf:
-                    bm25_temp = get_bm25_service()
-                    prf_docs = bm25_temp.search(query, top_k=5)
+                    if use_history:
+                        refiner.update_history(query)
 
-                refined = refiner.refine(
-                    query=query,
-                    apply_spelling=use_spelling,
-                    apply_synonyms=use_synonyms,
-                    apply_prf=use_prf,
-                    apply_history=use_history,
-                    top_docs=prf_docs,
-                    num_prf_terms=num_prf_terms,
-                    synonym_limit=1
-                )
+                    prf_docs = []
+                    if use_prf:
+                        bm25_temp = get_bm25_service()
+                        prf_docs = bm25_temp.search(query, top_k=5)
 
-                refined_query = refined['expanded_query']
-                refinement_info = refined
+                    refined = refiner.refine(
+                        query=query,
+                        apply_spelling=use_spelling,
+                        apply_synonyms=use_synonyms,
+                        apply_prf=use_prf,
+                        apply_history=use_history,
+                        top_docs=prf_docs,
+                        num_prf_terms=num_prf_terms,
+                        synonym_limit=1
+                    )
 
-                # Default values
-                bm25_candidates = bm25_candidates if 'bm25_candidates' in dir() else 100
-                fusion = fusion if 'fusion' in dir() else "rrf"
-                bm25_w = bm25_w if 'bm25_w' in dir() else 0.4
-                bert_w = bert_w if 'bert_w' in dir() else 0.6
+                    refined_query = refined['expanded_query']
+                    refinement_info = refined
 
-                # Execute search
-                if "BM25" in model and "Hybrid" not in model:
-                    svc = get_bm25_service()
-                    svc.k1 = k1
-                    svc.b = b
-                    results = svc.search(refined_query, top_k=top_k)
-                    method_used = f"BM25 (k1={k1}, b={b}) + Refinement"
+                    # Default values
+                    bm25_candidates = bm25_candidates if 'bm25_candidates' in dir() else 100
+                    fusion = fusion if 'fusion' in dir() else "rrf"
+                    bm25_w = bm25_w if 'bm25_w' in dir() else 0.4
+                    bert_w = bert_w if 'bert_w' in dir() else 0.6
 
-                elif "Hybrid Serial" in model:
-                    svc = get_hybrid_service()
-                    svc.k1 = k1
-                    svc.b = b
-                    results = svc.search(refined_query, mode="serial", top_k=top_k, bm25_candidates=bm25_candidates)
-                    method_used = f"Hybrid Serial + Refinement"
+                    # Execute search
+                    if "BM25" in model and "Hybrid" not in model:
+                        svc = get_bm25_service()
+                        svc.k1 = k1
+                        svc.b = b
+                        results = svc.search(refined_query, top_k=top_k)
+                        method_used = f"BM25 (k1={k1}, b={b}) + Refinement"
 
-                elif "Hybrid Parallel" in model:
-                    svc = get_hybrid_service()
-                    svc.k1 = k1
-                    svc.b = b
-                    results = svc.search(refined_query, mode="parallel", fusion=fusion,
-                                         top_k=top_k, bm25_weight=bm25_w, bert_weight=bert_w)
-                    method_used = f"Hybrid Parallel {fusion.upper()} + Refinement"
+                    elif "Hybrid Serial" in model:
+                        svc = get_hybrid_service()
+                        svc.k1 = k1
+                        svc.b = b
+                        results = svc.search(refined_query, mode="serial", top_k=top_k, bm25_candidates=bm25_candidates)
+                        method_used = f"Hybrid Serial + Refinement"
 
-                elif "VSM" in model:
-                    results = get_vsm_service().search(refined_query, top_k=top_k)
-                    method_used = "VSM TF-IDF + Refinement"
+                    elif "Hybrid Parallel" in model:
+                        svc = get_hybrid_service()
+                        svc.k1 = k1
+                        svc.b = b
+                        results = svc.search(refined_query, mode="parallel", fusion=fusion,
+                                             top_k=top_k, bm25_weight=bm25_w, bert_weight=bert_w)
+                        method_used = f"Hybrid Parallel {fusion.upper()} + Refinement"
 
-                elif "BERT" in model:
-                    results = get_bert_service().search(refined_query, top_k=top_k)
-                    method_used = "BERT Semantic + Refinement"
+                    elif "VSM" in model:
+                        results = get_vsm_service().search(refined_query, top_k=top_k)
+                        method_used = "VSM TF-IDF + Refinement"
 
-                else:
-                    results = get_simple_service().search(refined_query, top_k=top_k)
-                    method_used = "Simple TF-IDF + Refinement"
+                    elif "BERT" in model:
+                        results = get_bert_service().search(refined_query, top_k=top_k)
+                        method_used = "BERT Semantic + Refinement"
 
-                if results:
-                    for r in results:
-                        r['refinement_info'] = refinement_info
+                    else:
+                        results = get_simple_service().search(refined_query, top_k=top_k)
+                        method_used = "Simple TF-IDF + Refinement"
 
-            except Exception as e:
-                st.error(f"Search error: {e}")
-                import traceback
-                st.error(traceback.format_exc())
+                    if results:
+                        for r in results:
+                            r['refinement_info'] = refinement_info
 
-        elapsed = time.time() - t0
+                except Exception as e:
+                    st.error(f"Search error: {e}")
+                    import traceback
+                    st.error(traceback.format_exc())
 
-        if results:
-            st.success(f"✅ {len(results)} results in {elapsed:.3f}s")
-            st.caption(f"📐 Method: {method_used}")
+            elapsed = time.time() - t0
 
-            if use_spelling or use_synonyms or use_prf or use_history:
-                with st.expander("🧠 Query Refinement Summary", expanded=False):
-                    st.write(f"**Original:** `{query}`")
-                    st.write(f"**Refined:** `{refined_query}`")
-                    if refinement_info.get('prf_terms_added'):
-                        st.write(f"**PRF Terms Added:** `{refinement_info['prf_terms_added']}`")
-                    if refinement_info.get('synonyms_added'):
-                        st.write(f"**Synonyms Added:** `{refinement_info['synonyms_added']}`")
-                    if refinement_info.get('history_boost_applied'):
-                        st.write(f"**History Boost:** `{refinement_info['history_boost_applied']}`")
-                    st.write(f"**Final Weights:** `{refinement_info.get('weights', {})}`")
+            if results:
+                st.success(f"✅ {len(results)} results in {elapsed:.3f}s")
+                st.caption(f"📐 Method: {method_used}")
 
-            st.markdown("---")
-
-            for i, r in enumerate(results, 1):
-                score = r["score"]
-                dot = "🟢" if score > 0.7 else ("🟡" if score > 0.3 else "🟠")
-
-                st.markdown(f"### {i}. 📄 `{r['doc_id']}`")
-                st.markdown(f"**🎯 Score:** `{dot} {score:.6f}`")
-
-                if "bm25_rank" in r:
-                    st.caption(f"BM25 rank: {r['bm25_rank']} | BERT rank: {r['bert_rank']}")
-
-                if show_text and r.get("text"):
-                    st.markdown("**📖 Content:**")
-                    preview = r["text"][:max_text_len]
-                    if len(r["text"]) > max_text_len:
-                        preview += "..."
-                    st.markdown(f"> {preview}")
-                    with st.expander("📚 Full document"):
-                        st.write(r.get("full_text", r["text"]))
-
-                if show_matching:
-                    with st.expander("🔍 Matching details"):
-                        _show_matching(r, query, model)
+                if use_spelling or use_synonyms or use_prf or use_history:
+                    with st.expander("🧠 Query Refinement Summary", expanded=False):
+                        st.write(f"**Original:** `{query}`")
+                        st.write(f"**Refined:** `{refined_query}`")
+                        if refinement_info.get('prf_terms_added'):
+                            st.write(f"**PRF Terms Added:** `{refinement_info['prf_terms_added']}`")
+                        if refinement_info.get('synonyms_added'):
+                            st.write(f"**Synonyms Added:** `{refinement_info['synonyms_added']}`")
+                        if refinement_info.get('history_boost_applied'):
+                            st.write(f"**History Boost:** `{refinement_info['history_boost_applied']}`")
+                        st.write(f"**Final Weights:** `{refinement_info.get('weights', {})}`")
 
                 st.markdown("---")
-        else:
-            st.warning("⚠️ No results found.")
 
-    # ── About ─────────────────────────────────────────────────────────────────
-    with st.expander("ℹ️ About this system"):
-        st.markdown("""
-        ### IR System 2026 – Optimized Query Refinement
-        - **Spelling Correction**: Fast pyspellchecker + vocabulary validation.
-        - **Synonym Expansion**: Only adds synonyms present in the index (max 1 per term).
-        - **PRF**: Extracts max 3 terms using strict DF thresholds (min_df=2, max_df=60%).
-        - **History Weighting**: Additive boost for previously searched terms.
-        """)
+                for i, r in enumerate(results, 1):
+                    score = r["score"]
+                    dot = "🟢" if score > 0.7 else ("🟡" if score > 0.3 else "🟠")
+
+                    st.markdown(f"### {i}. 📄 `{r['doc_id']}`")
+                    st.markdown(f"**🎯 Score:** `{dot} {score:.6f}`")
+
+                    if "bm25_rank" in r:
+                        st.caption(f"BM25 rank: {r['bm25_rank']} | BERT rank: {r['bert_rank']}")
+
+                    if show_text and r.get("text"):
+                        st.markdown("**📖 Content:**")
+                        preview = r["text"][:max_text_len]
+                        if len(r["text"]) > max_text_len:
+                            preview += "..."
+                        st.markdown(f"> {preview}")
+                        with st.expander("📚 Full document"):
+                            st.write(r.get("full_text", r["text"]))
+
+                    if show_matching:
+                        with st.expander("🔍 Matching details"):
+                            _show_matching(r, query, model)
+
+                    st.markdown("---")
+            else:
+                st.warning("⚠️ No results found.")
+
+        # ── About ─────────────────────────────────────────────────────────────────
+        with st.expander("ℹ️ About this system"):
+            st.markdown("""
+            ### IR System 2026 – Optimized Query Refinement
+            - **Spelling Correction**: Fast pyspellchecker + vocabulary validation.
+            - **Synonym Expansion**: Only adds synonyms present in the index (max 1 per term).
+            - **PRF**: Extracts max 3 terms using strict DF thresholds (min_df=2, max_df=60%).
+            - **History Weighting**: Additive boost for previously searched terms.
+            """)
+
+    with tab2:
+        _show_evaluation_tab()
 
 
 # ── Sidebar stats ─────────────────────────────────────────────────────────────
@@ -447,6 +454,128 @@ def _show_matching(result: dict, query: str, model: str):
 
     except Exception as e:
         st.write(f"Error: {e}")
+
+
+def _show_evaluation_tab():
+    st.header("📊 ClinicalTrials IR System Evaluation")
+    st.markdown("""
+    Evaluate all retrieval models using the official relevance judgments (qrels) from **ClinicalTrials (TREC PM 2017)**.
+    The evaluation compares the models **Before Improvements (Baseline)** versus **After Improvements (+ Query Refinement)**.
+    """)
+    
+    results_path = "data/evaluation/results_clinical.json"
+    
+    if not os.path.exists(results_path):
+        st.warning("⚠️ No evaluation results found. Please run the evaluation pipeline first.")
+        if st.button("🚀 Run End-to-End Evaluation Pipeline"):
+            with st.spinner("Running evaluation (this may take a few minutes)..."):
+                import subprocess
+                try:
+                    res = subprocess.run([sys.executable, "scripts/evaluate.py"], capture_output=True, text=True, check=True)
+                    st.success("✅ Evaluation pipeline completed successfully!")
+                    st.cache_resource.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error running evaluation: {e}")
+        return
+        
+    # Load results
+    with open(results_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        
+    st.markdown("### 📈 System Configuration & Statistics")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Test Set / Dataset", "TREC PM 2017")
+    with col2:
+        st.metric("Evaluable Queries", f"{data.get('eval_queries', 0)}")
+    with col3:
+        st.metric("Indexed Documents", f"{data.get('indexed_docs', 0):,}")
+        
+    # Parse models into a dataframe
+    models_data = data.get("models", {})
+    
+    import pandas as pd
+    rows = []
+    for model_name, metrics in models_data.items():
+        rows.append({
+            "Model": model_name,
+            "MAP": round(metrics.get("map", 0), 4),
+            "nDCG@10": round(metrics.get("ndcg_cut_10", 0), 4),
+            "P@10": round(metrics.get("P_10", 0), 4),
+            "Recall@100": round(metrics.get("recall", 0), 4)
+        })
+    df = pd.DataFrame(rows)
+    
+    st.markdown("### 📊 Metric Comparison Table")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # Let's separate Baseline vs Refinement for side-by-side comparison charts
+    chart_rows = []
+    for model_name, metrics in models_data.items():
+        if "Baseline" in model_name:
+            base_name = model_name.replace(" (Baseline)", "")
+            version = "Baseline (Before)"
+        elif "+ Refinement" in model_name:
+            base_name = model_name.replace(" (+ Refinement)", "")
+            version = "Enhanced (After)"
+        else:
+            base_name = model_name
+            version = "Standard"
+            
+        chart_rows.append({
+            "Model": base_name,
+            "Version": version,
+            "MAP": metrics.get("map", 0),
+            "nDCG@10": metrics.get("ndcg_cut_10", 0),
+            "P@10": metrics.get("P_10", 0),
+            "Recall@100": metrics.get("recall", 0)
+        })
+        
+    df_chart = pd.DataFrame(chart_rows)
+    
+    st.markdown("### 📈 Visual Performance Comparison")
+    
+    metric_to_plot = st.selectbox("Select metric to visualize", ["MAP", "nDCG@10", "P@10", "Recall@100"])
+    
+    # Pivot for side-by-side plotting: index=Model, columns=Version, values=metric
+    df_pivot = df_chart.pivot(index="Model", columns="Version", values=metric_to_plot)
+    
+    st.bar_chart(df_pivot, use_container_width=True)
+    
+    # Highlight achievements
+    st.markdown("### 💡 Key Evaluation Findings")
+    best_base_model = ""
+    best_base_score = -1
+    best_enh_model = ""
+    best_enh_score = -1
+    
+    for row in chart_rows:
+        score = row[metric_to_plot]
+        if row["Version"] == "Baseline (Before)":
+            if score > best_base_score:
+                best_base_score = score
+                best_base_model = row["Model"]
+        elif row["Version"] == "Enhanced (After)":
+            if score > best_enh_score:
+                best_enh_score = score
+                best_enh_model = row["Model"]
+                
+    st.info(f"🏆 **Best Performing Model ({metric_to_plot}):**")
+    st.markdown(f"- **Baseline (Before Improvements):** `{best_base_model}` with `{best_base_score:.4f}`")
+    st.markdown(f"- **Enhanced (After Improvements):** `{best_enh_model}` with `{best_enh_score:.4f}`")
+    
+    st.markdown("---")
+    if st.button("🔄 Re-run Evaluation Pipeline", key="btn_rerun_eval"):
+        with st.spinner("Re-running evaluation (this may take a few minutes)..."):
+            import subprocess
+            try:
+                subprocess.run([sys.executable, "scripts/evaluate.py"], capture_output=True, text=True, check=True)
+                st.success("✅ Evaluation completed and updated!")
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 
 if __name__ == "__main__":

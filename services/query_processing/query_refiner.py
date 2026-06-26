@@ -129,7 +129,20 @@ class QueryRefiner:
 
         expanded_lower = {t.lower() for t in expanded}
 
+        BLOCKED_SYNONYM_TOKENS = {
+            'cancer', 'tumor', 'tumour', 'disease', 'none', 'male', 'female', 
+            'patient', 'patients', 'year', 'yearold', 'month', 'monthold', 
+            'day', 'dayold', 'old', 'age', 'history', 'symptom', 'symptoms',
+            'therapy', 'treatment', 'inactivating', 'inactivate', 'active',
+            'activation', 'amplification', 'amplify', 'loss', 'gain', 'mutation',
+            'mutate', 'mutated', 'variant', 'gene', 'protein', 'receptor',
+            'kinase', 'inhibitor', 'blocker', 'depression', 'hypertension',
+            'diabetes'
+        }
+
         for token, pos in tagged_tokens:
+            if token.lower() in BLOCKED_SYNONYM_TOKENS:
+                continue
             wn_pos = get_wordnet_pos(pos) or wordnet.NOUN
             synsets = wordnet.synsets(token, pos=wn_pos)
             added = 0
