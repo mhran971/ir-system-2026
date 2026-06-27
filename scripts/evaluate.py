@@ -1,7 +1,7 @@
 # scripts/evaluate.py
 """
 Evaluation Script — compares all IR models on ClinicalTrials 2017 (TREC 2017).
-Evaluates each model twice: Baseline (before enhancements) and + Refinement (after enhancements).
+Evaluates each model ONLY on Baseline (no Query Refinement).
 
 Run after building all indexes:
     python scripts/evaluate.py
@@ -22,7 +22,6 @@ from services.retrieval.vsm_search_service import VSMSearchService
 from services.ranking.embeddings.bert_search_service import BERTSearchService
 from services.ranking.hybrid.hybrid_search_service import HybridSearchService
 from services.evaluation.evaluation_service import EvaluationService
-from services.query_processing.query_refiner import QueryRefiner
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -55,44 +54,34 @@ def print_table(results: dict) -> None:
 def main():
     print("=" * 60)
     print("📊 IR System 2026 — Model Evaluation (TREC PM 2017)")
-    print("   Evaluating: Baseline vs Enhanced (+ Refinement)")
+    print("   Evaluating: Baseline models ONLY (No Query Refinement)")
     print(f"   Top-K    : {TOP_K}")
     print("=" * 60)
 
     # ── Load services ─────────────────────────────────────────────────────────
-    print("\n[1/6] Loading BM25 service...")
+    print("\n[1/5] Loading BM25 service...")
     bm25_svc = BM25SearchService(k1=1.5, b=0.75)
 
-    print("\n[2/6] Loading VSM service...")
+    print("\n[2/5] Loading VSM service...")
     vsm_svc = VSMSearchService()
 
-    print("\n[3/6] Loading BERT service...")
-    bert_svc = BERTSearchService(model_key="fast")
+    print("\n[3/5] Loading BERT service...")
+    model_key = os.getenv("BERT_MODEL_KEY", "fast")
+    bert_svc = BERTSearchService(model_key=model_key)
 
-    print("\n[4/6] Loading Hybrid service...")
+    print("\n[4/5] Loading Hybrid service...")
     hybrid_svc = HybridSearchService(
         bm25_service=bm25_svc,
         bert_service=bert_svc,
     )
 
     # ── Build indexed_doc_ids ────────────────────────────────────────────────
-    print("\n[5/6] Collecting indexed doc IDs...")
+    print("\n[5/5] Collecting indexed doc IDs...")
     indexed_doc_ids = set(bm25_svc.document_store.get_all_documents().keys())
     print(f"  Indexed docs: {len(indexed_doc_ids):,}")
 
-    # ── Init QueryRefiner ─────────────────────────────────────────────────────
-    print("\n[6/6] Initializing QueryRefiner...")
-    known_terms = set(bm25_svc.inverted_index.doc_frequency.keys())
-    term_freqs = dict(bm25_svc.inverted_index.doc_frequency)
-    total_docs = bm25_svc.document_store.total_docs
-    refiner = QueryRefiner(
-        known_terms=known_terms,
-        term_frequencies=term_freqs,
-        total_docs=total_docs
-    )
-
     # ── Init EvaluationService (TREC 2017 qrels) ─────────────────────────────
-    print("\n[7/7] Initialising EvaluationService (TREC 2017)...")
+    print("\n[6/6] Initialising EvaluationService (TREC 2017)...")
     eval_svc = EvaluationService(indexed_doc_ids=indexed_doc_ids)
     
     # Load ClinicalTrials dataset
@@ -106,150 +95,99 @@ def main():
         print("\n⚠️  No evaluable queries — cannot continue.")
         return
 
-    # ── Helper search functions ────────────────────────────────────────────────
-
-    def refined_search(search_fn, q, k):
-        """BM25/VSM refinement: spelling + PRF expansion."""
-        prf_docs = bm25_svc.search(q, top_k=5)
-        refined = refiner.refine(
-            query=q,
-            apply_spelling=True,
-            apply_prf=True,
-            top_docs=prf_docs,
-            num_prf_terms=3,
-        )
-        return search_fn(refined["expanded_query"], k)
-
-    def refined_bert_search(search_fn, q, k):
-        """BERT refinement: spelling only (no PRF — expansion dilutes dense embeddings)."""
-        refined = refiner.refine(query=q, apply_spelling=True, apply_prf=False)
-        return search_fn(refined["expanded_query"], k)
-
-    def refined_hybrid_search(q, k, mode, bm25_candidates=300, fusion="rrf",
-                               bm25_weight=0.6, bert_weight=0.4):
-        """Hybrid refinement: BM25 uses the PRF-expanded query for recall;
-        BERT receives the original query to preserve embedding quality."""
-        prf_docs = bm25_svc.search(q, top_k=5)
-        refined = refiner.refine(
-            query=q,
-            apply_spelling=True,
-            apply_prf=True,
-            top_docs=prf_docs,
-            num_prf_terms=3,
-        )
-        return hybrid_svc.search(
-            refined["expanded_query"],
-            mode=mode,
-            fusion=fusion,
-            top_k=k,
-            bm25_candidates=bm25_candidates,
-            bm25_weight=bm25_weight,
-            bert_weight=bert_weight,
-            bert_query=q,   # original query for BERT — not expanded
-        )
-
     # ── Run evaluation ────────────────────────────────────────────────────────
     all_results = {}
 
     # 1. BM25
-    agg_base, _ = eval_svc.evaluate(
+    print("\n📊 Evaluating BM25...")
+    agg, _ = eval_svc.evaluate(
         search_fn=lambda q, k: bm25_svc.search(q, top_k=k),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="BM25 (Baseline)"
+        top_k=TOP_K, max_queries=MAX_QUERIES, label="BM25"
     )
-    all_results["BM25 (Baseline)"] = agg_base
-
-    agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_search(lambda rq, rk: bm25_svc.search(rq, top_k=rk), q, k),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="BM25 (+ Refinement)"
-    )
-    all_results["BM25 (+ Refinement)"] = agg_enh
+    all_results["BM25"] = agg
 
     # 2. VSM TF-IDF
-    agg_base, _ = eval_svc.evaluate(
+    print("\n📊 Evaluating VSM TF-IDF...")
+    agg, _ = eval_svc.evaluate(
         search_fn=lambda q, k: vsm_svc.search(q, top_k=k),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="VSM TF-IDF (Baseline)"
+        top_k=TOP_K, max_queries=MAX_QUERIES, label="VSM TF-IDF"
     )
-    all_results["VSM TF-IDF (Baseline)"] = agg_base
-
-    agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_search(lambda rq, rk: vsm_svc.search(rq, top_k=rk), q, k),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="VSM TF-IDF (+ Refinement)"
-    )
-    all_results["VSM TF-IDF (+ Refinement)"] = agg_enh
+    all_results["VSM TF-IDF"] = agg
 
     # 3. BERT
-    agg_base, _ = eval_svc.evaluate(
+    print("\n📊 Evaluating BERT...")
+    agg, _ = eval_svc.evaluate(
         search_fn=lambda q, k: bert_svc.search(q, top_k=k),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="BERT (Baseline)"
+        top_k=TOP_K, max_queries=MAX_QUERIES, label="BERT"
     )
-    all_results["BERT (Baseline)"] = agg_base
-
-    # BERT refinement: only spelling correction avoids embedding dilution
-    agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_bert_search(lambda rq, rk: bert_svc.search(rq, top_k=rk), q, k),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="BERT (+ Refinement)"
-    )
-    all_results["BERT (+ Refinement)"] = agg_enh
+    all_results["BERT"] = agg
 
     # 4. Hybrid Serial
-    # bm25_candidates=300 > top_k=100 so BERT has a larger pool to reorder;
-    # bm25_weight=0.6 because BM25 outperforms BERT on this medical corpus.
-    agg_base, _ = eval_svc.evaluate(
+    print("\n📊 Evaluating Hybrid Serial...")
+    agg, _ = eval_svc.evaluate(
         search_fn=lambda q, k: hybrid_svc.search(
             q, mode="serial", top_k=k, bm25_candidates=300,
-            bm25_weight=0.6, bert_weight=0.4,
+            bm25_weight=1.5, bert_weight=0.5,
         ),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Serial (Baseline)"
+        top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Serial"
     )
-    all_results["Hybrid Serial (Baseline)"] = agg_base
-
-    agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_hybrid_search(
-            q, k, mode="serial", bm25_candidates=300,
-            bm25_weight=0.6, bert_weight=0.4,
-        ),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Serial (+ Refinement)"
-    )
-    all_results["Hybrid Serial (+ Refinement)"] = agg_enh
+    all_results["Hybrid Serial"] = agg
 
     # 5. Hybrid Parallel RRF
-    # Weighted RRF: BM25 weight 1.5 vs BERT weight 0.5 because BM25 is stronger
-    # on domain-specific medical text; equal weights let BERT pollute top results.
-    agg_base, _ = eval_svc.evaluate(
+    print("\n📊 Evaluating Hybrid Parallel RRF...")
+    agg, _ = eval_svc.evaluate(
         search_fn=lambda q, k: hybrid_svc.search(
             q, mode="parallel", fusion="rrf", top_k=k,
             bm25_weight=1.5, bert_weight=0.5,
         ),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Parallel RRF (Baseline)"
+        top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Parallel RRF"
     )
-    all_results["Hybrid Parallel RRF (Baseline)"] = agg_base
+    all_results["Hybrid Parallel RRF"] = agg
 
-    agg_enh, _ = eval_svc.evaluate(
-        search_fn=lambda q, k: refined_hybrid_search(
-            q, k, mode="parallel", fusion="rrf",
-            bm25_weight=1.5, bert_weight=0.5,
-        ),
-        top_k=TOP_K, max_queries=MAX_QUERIES, label="Hybrid Parallel RRF (+ Refinement)"
-    )
-    all_results["Hybrid Parallel RRF (+ Refinement)"] = agg_enh
-
-    # ── Print comparison table ───────────────────────────────────────────────
+    # ── Print results ────────────────────────────────────────────────────────
     print("\n\n" + "=" * 60)
     print("📊 MODEL COMPARISON — ClinicalTrials 2017 (TREC 2017)")
+    print("   (Baseline models — NO Query Refinement)")
     print("=" * 60)
     print_table(all_results)
 
+    # ── Identify the best model ──────────────────────────────────────────────
+    print("\n🏆 BEST MODEL BY METRIC:")
+    print("-" * 60)
+    
+    # Find best per metric
+    metrics = ['map', 'ndcg_cut_10', 'P_10', 'recall']
+    metric_names = {
+        'map': 'MAP',
+        'ndcg_cut_10': 'nDCG@10',
+        'P_10': 'P@10',
+        'recall': 'Recall@100'
+    }
+    
+    for metric in metrics:
+        best_model = max(all_results.items(), key=lambda x: x[1].get(metric, 0))
+        print(f"  {metric_names[metric]:<12} → {best_model[0]:<25} ({best_model[1].get(metric, 0):.4f})")
+
     # ── Save results ──────────────────────────────────────────────────────────
     os.makedirs("data/evaluation", exist_ok=True)
-    out_path = "data/evaluation/results_clinical.json"
+    out_path = "data/evaluation/results_clinical_baseline_only.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "test_set":      "clinicaltrials/2017/trec-pm-2017",
                 "top_k":         TOP_K,
+                "description":   "Baseline models ONLY — NO Query Refinement",
                 "indexed_docs":  len(indexed_doc_ids),
                 "eval_queries":  stats["evaluable_queries"],
                 "models":        all_results,
+                "best_by_metric": {
+                    metric: {
+                        "model": best_model[0],
+                        "score": best_model[1].get(metric, 0)
+                    }
+                    for metric in metrics
+                    for best_model in [max(all_results.items(), key=lambda x: x[1].get(metric, 0))]
+                }
             },
             f, indent=2, ensure_ascii=False
         )

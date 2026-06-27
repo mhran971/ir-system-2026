@@ -12,11 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from rank_bm25 import BM25Okapi
-
-
-def identity_analyzer(doc):
-    """Pass-through analyzer for pre-tokenized inputs."""
-    return doc
+from services.retrieval.vsm_search_service import identity_analyzer
 
 
 def get_index_dir() -> str:

@@ -1,351 +1,267 @@
+# services/query_processing/query_refiner.py
 """
-Query Refinement Service — Medical IR (ClinicalTrials)
-
-Two public capabilities:
-  refine()         → Query formulation assistance: spelling + PRF
-  suggest_queries() → Query suggestion: alternative phrasings for the UI
-
-Design decisions:
-- Synonym expansion removed from refine(): even with a curated medical thesaurus
-  the substring matching was adding unrelated synonyms and hurting MAP.
-  PRF is strictly better — it uses terms that actually co-occur in retrieved docs.
-- QuerySegmenter removed: stripping "38-year-old male" from a TREC PM query
-  removes eligibility-matching terms, hurting recall on clinical trial retrieval.
-- Token repetition removed: repeating base tokens 3× makes queries artificially
-  long and confuses BM25's term-frequency scoring.
+Query Refinement Module with Multiple Strategies
 """
 
 import re
-import os
-import pickle
-from math import log
-from typing import List, Dict, Set, Optional, Any, Tuple
+from typing import List, Dict, Set, Optional, Tuple
 from collections import Counter
+import math
 
-from spellchecker import SpellChecker
-from nltk.tokenize import word_tokenize
-
-from services.query_processing.query_processor import QueryProcessor
-
-
-# ── Medical thesaurus (kept for suggest_queries only) ─────────────────────────
-
-MEDICAL_THESAURUS: Dict[str, List[str]] = {
-    'cancer':           ['carcinoma', 'malignancy', 'neoplasm'],
-    'breast cancer':    ['breast carcinoma', 'mammary cancer'],
-    'lung cancer':      ['pulmonary carcinoma', 'lung carcinoma'],
-    'colorectal cancer':['colon cancer', 'rectal cancer', 'colorectal carcinoma'],
-    'pancreatic cancer':['pancreatic carcinoma', 'pancreas cancer'],
-    'liver cancer':     ['hepatocellular carcinoma', 'hepatic cancer'],
-    'melanoma':         ['malignant melanoma', 'cutaneous melanoma'],
-    'leukemia':         ['leukaemia', 'haematological malignancy'],
-    'lymphoma':         ['lymphatic cancer', 'lymphatic malignancy'],
-    'tumor':            ['neoplasm', 'lesion', 'mass'],
-    'metastasis':       ['metastatic disease', 'secondary tumor'],
-    'mutation':         ['variant', 'alteration', 'gene mutation'],
-    'amplification':    ['gene amplification', 'copy number gain'],
-    'HER2':             ['ERBB2', 'HER2/neu'],
-    'EGFR':             ['epidermal growth factor receptor', 'ERBB1'],
-    'KRAS':             ['K-Ras', 'KRAS mutation'],
-    'BRAF':             ['BRAF mutation', 'BRAF V600E'],
-    'BRCA1':            ['breast cancer gene 1', 'BRCA1 mutation'],
-    'BRCA2':            ['breast cancer gene 2', 'BRCA2 mutation'],
-    'chemotherapy':     ['cytotoxic therapy', 'antineoplastic therapy'],
-    'immunotherapy':    ['immune therapy', 'biological therapy'],
-    'hypertension':     ['high blood pressure', 'HTN'],
-    'diabetes':         ['diabetes mellitus', 'DM'],
-}
-
-# Clinical trial boilerplate to exclude from PRF
-_PRF_EXCLUDED = {
-    'patient', 'patients', 'study', 'studies', 'trial', 'trials', 'clinical',
-    'treatment', 'therapy', 'therapeutic', 'evaluable', 'assessed', 'enrolled',
-    'eligibility', 'criteria', 'inclusion', 'exclusion', 'date', 'group', 'groups',
-    'daily', 'dose', 'doses', 'week', 'weeks', 'month', 'months', 'year', 'years',
-    'day', 'days', 'history', 'diagnosed', 'diagnosis', 'active', 'prior',
-    'receive', 'receiving', 'efficacy', 'safety', 'associated', 'results',
-}
-
-# Protected gene/mutation tokens — never spell-correct these
-_PROTECTED_GENES = {
-    'kras', 'braf', 'cdk4', 'nf2', 'akt1', 'fgfr1', 'pten', 'cdkn2a', 'nras',
-    'egfr', 'eml4', 'alk', 'kit', 'pik3ca', 'brca2', 'idh1', 'stk11', 'cdk6',
-    'mdm2', 'met', 'tp53', 'erbb3', 'erbb2', 'brca1', 'rb1',
-}
-
-
-# ── Sub-service: Medical-aware spelling correction ────────────────────────────
-
-class MedicalSpeller:
-    """
-    Corrects misspelled tokens while protecting gene names, mutation codes,
-    uppercase abbreviations, and numbers from being "corrected" into common
-    English words (e.g., KRAS must never become "grass").
-    """
-
-    def __init__(self, known_terms: Set[str], spell_checker: SpellChecker):
-        self.known_terms = known_terms
-        self.spell_checker = spell_checker
-
-    def _should_protect(self, token: str) -> bool:
-        if any(c.isdigit() for c in token):
-            return True
-        if any(c.isupper() for c in token):
-            return True
-        if len(token) < 3:
-            return True
-        if token.lower() in _PROTECTED_GENES:
-            return True
-        return False
-
-    def correct(self, query: str) -> Tuple[str, List[Tuple[str, str]]]:
-        tokens = word_tokenize(query)
-        out, fixes = [], []
-        for tok in tokens:
-            if self._should_protect(tok) or tok.lower() in self.known_terms:
-                out.append(tok)
-                continue
-            candidate = self.spell_checker.correction(tok)
-            if candidate and candidate.lower() != tok.lower() and candidate.lower() in self.known_terms:
-                out.append(candidate.capitalize() if tok[0].isupper() else candidate)
-                fixes.append((tok, candidate))
-            else:
-                out.append(tok)
-        corrected = " ".join(out)
-        corrected = re.sub(r'\s+([,\).])', r'\1', corrected)
-        corrected = re.sub(r'(\()\s+', r'\1', corrected)
-        return corrected, fixes
-
-
-# ── Sub-service: Corpus-aware PRF ────────────────────────────────────────────
-
-class MedicalPRF:
-    """
-    Pseudo-Relevance Feedback using corpus IDF scores.
-    Extracts high-value terms from top-retrieved documents,
-    excluding clinical-trial boilerplate and boosting gene/mutation-like tokens.
-    """
-
-    def __init__(self, preprocessor, term_frequencies: Dict[str, int], total_docs: int):
-        self.preprocessor = preprocessor
-        self.term_frequencies = term_frequencies
-        self.total_docs = total_docs
-
-    def extract_terms(
-        self,
-        top_docs: List[Dict],
-        original_tokens: List[str],
-        num_terms: int = 3,
-    ) -> List[str]:
-        if not top_docs or len(top_docs) < 2:
-            return []
-
-        original_set = {t.lower() for t in original_tokens}
-        term_doc_count: Counter = Counter()
-        doc_term_freqs: List[Counter] = []
-
-        for doc in top_docs[:5]:
-            text = doc.get("full_text") or doc.get("text") or ""
-            if not text:
-                continue
-            tokens = self.preprocessor.process(text)
-            if not tokens:
-                continue
-            filtered = [
-                t for t in tokens
-                if t.lower() not in original_set
-                and t.lower() not in _PRF_EXCLUDED
-                and len(t) >= 3
-            ]
-            if not filtered:
-                continue
-            tf = Counter(filtered)
-            doc_term_freqs.append(tf)
-            for term in set(filtered):
-                term_doc_count[term] += 1
-
-        if not doc_term_freqs:
-            return []
-
-        N = len(doc_term_freqs)
-        min_df = 2
-        max_df = max(int(N * 0.7), 2)
-        scores: Dict[str, float] = {}
-
-        for term, df in term_doc_count.items():
-            if df < min_df or df > max_df:
-                continue
-            coll_df = self.term_frequencies.get(term, df)
-            idf = log((self.total_docs + 1) / (coll_df + 1))
-            boost = 2.5 if (any(c.isupper() for c in term) or any(c.isdigit() for c in term)) else 1.0
-            total_tf = sum(tf.get(term, 0) for tf in doc_term_freqs)
-            scores[term] = total_tf * idf * boost
-
-        return [t for t, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:num_terms]]
-
-
-# ── Main orchestrator ─────────────────────────────────────────────────────────
 
 class QueryRefiner:
     """
-    Medical query refinement with two public capabilities:
-
-    1. refine()         — formulation assistance: spelling + PRF
-    2. suggest_queries() — query suggestion: clickable alternative queries for the UI
-
-    Legacy parameters (apply_synonyms, apply_history, apply_profile, synonym_limit)
-    are accepted but silently ignored so existing callers don't break.
+    Query refinement with multiple strategies:
+    - Spelling correction (customizable)
+    - PRF with term selection
+    - Domain-specific term filtering
     """
-
+    
     def __init__(
         self,
-        known_terms: Optional[Set[str]] = None,
-        term_frequencies: Optional[Dict[str, int]] = None,
-        total_docs: int = 0,
-        **kwargs,          # absorbs unused legacy params (model_name, etc.)
+        known_terms: Set[str],
+        term_frequencies: Dict[str, int],
+        total_docs: int,
+        medical_terms: Optional[Set[str]] = None
     ):
-        print("Initializing QueryRefiner...")
-        self.query_processor = QueryProcessor()
-        self.preprocessor = self.query_processor.preprocessor
-        self.stopwords = self.preprocessor.stop_words
-
-        self.known_terms = known_terms or set()
-        self.term_frequencies = term_frequencies or {}
-        self.total_docs = max(total_docs, 1)
-
-        self.spell_checker = SpellChecker()
-        self.speller = MedicalSpeller(self.known_terms, self.spell_checker)
-        self.prf_service = MedicalPRF(self.preprocessor, self.term_frequencies, self.total_docs)
-
-        # Lightweight history for UI session (term counts only, no SBERT)
-        self.user_history_terms: Dict[str, int] = {}
-
-        print(f"QueryRefiner ready — vocab={len(self.known_terms):,} docs={self.total_docs:,}")
-
-    # ── Formulation assistance ────────────────────────────────────────────────
-
+        """
+        Args:
+            known_terms: All terms in the index
+            term_frequencies: Document frequency per term
+            total_docs: Total number of documents
+            medical_terms: Optional set of medical domain terms
+        """
+        self.known_terms = known_terms
+        self.term_frequencies = term_frequencies
+        self.total_docs = total_docs
+        self.medical_terms = medical_terms or set()
+        
+        # Create a set of common stopwords
+        self.stopwords = {
+            'a', 'an', 'the', 'of', 'to', 'for', 'with', 'on', 'at', 'from',
+            'by', 'in', 'as', 'is', 'was', 'were', 'are', 'am', 'be', 'been',
+            'being', 'and', 'or', 'but', 'so', 'for', 'nor', 'yet'
+        }
+    
     def refine(
         self,
         query: str,
-        top_docs: Optional[List[Dict]] = None,
+        strategy: str = "conservative",  # "conservative", "moderate", "aggressive"
         apply_spelling: bool = True,
         apply_prf: bool = True,
-        num_prf_terms: int = 3,
-        # Legacy params — accepted but ignored
-        apply_synonyms: bool = False,
-        apply_history: bool = False,
-        apply_profile: bool = False,
-        synonym_limit: int = 0,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """
-        Query formulation assistance.
-
-        Steps:
-          1. Spelling correction (medical-aware: protects genes/mutations)
-          2. PRF expansion from top-retrieved documents (corpus-aware)
-
-        Returns expanded_query = corrected_tokens + prf_terms (one occurrence each).
-        Pass apply_prf=False for BERT to avoid embedding dilution.
-        """
-        current_query = query
-        corrections_made: List[Tuple[str, str]] = []
-
-        if apply_spelling:
-            current_query, corrections_made = self.speller.correct(current_query)
-
-        base_tokens = self.preprocessor.process(current_query)
-        prf_terms: List[str] = []
-
-        if apply_prf and top_docs and base_tokens:
-            prf_terms = self.prf_service.extract_terms(top_docs, base_tokens, num_terms=num_prf_terms)
-
-        final_tokens = base_tokens + [t for t in prf_terms if t not in base_tokens]
-        expanded_query = " ".join(final_tokens) if final_tokens else current_query
-
-        return {
-            "original":              query,
-            "corrected":             current_query,
-            "expanded_query":        expanded_query,
-            "prf_terms_added":       prf_terms,
-            "corrections_made":      corrections_made,
-            # Legacy keys kept for UI/evaluate.py compatibility
-            "tokens":                final_tokens,
-            "weights":               {},
-            "synonyms_added":        [],
-            "history_boost_applied": {},
-        }
-
-    # ── Query suggestion ──────────────────────────────────────────────────────
-
-    def suggest_queries(
-        self,
-        query: str,
         top_docs: Optional[List[Dict]] = None,
-        n: int = 3,
+        num_prf_terms: int = 2,
+        min_term_freq: int = 1,
+        max_term_freq_ratio: float = 0.3,
+        min_idf_threshold: float = 1.0,
+    ) -> Dict[str, any]:
+        """
+        Refine a query with controlled strategies.
+        
+        Args:
+            strategy: "conservative", "moderate", "aggressive"
+            apply_spelling: Whether to apply spelling correction
+            apply_prf: Whether to apply PRF
+            top_docs: Top documents from initial retrieval
+            num_prf_terms: Number of PRF terms to add (capped by strategy)
+            min_term_freq: Minimum document frequency for PRF terms
+            max_term_freq_ratio: Maximum document frequency ratio (avoid common terms)
+            min_idf_threshold: Minimum IDF for PRF terms
+        
+        Returns:
+            Dict with original_query, expanded_query, added_terms, spelling_corrections
+        """
+        original_query = query.strip()
+        expanded_query = original_query
+        added_terms = []
+        spelling_corrections = {}
+        
+        # 1. Spelling Correction
+        if apply_spelling:
+            expanded_query, spelling_corrections = self._correct_spelling(expanded_query)
+        
+        # 2. PRF Expansion (with term selection)
+        if apply_prf and top_docs and len(top_docs) > 0:
+            prf_terms = self._extract_prf_terms(
+                top_docs=top_docs,
+                num_terms=num_prf_terms,
+                min_term_freq=min_term_freq,
+                max_term_freq_ratio=max_term_freq_ratio,
+                min_idf_threshold=min_idf_threshold,
+                strategy=strategy,
+            )
+            
+            # Add terms that are not already in query
+            query_terms = set(expanded_query.lower().split())
+            for term in prf_terms:
+                if term not in query_terms and len(term) > 2:
+                    expanded_query += f" {term}"
+                    added_terms.append(term)
+                    query_terms.add(term)
+        
+        return {
+            "original_query": original_query,
+            "expanded_query": expanded_query,
+            "added_terms": added_terms,
+            "spelling_corrections": spelling_corrections,
+        }
+    
+    def _correct_spelling(self, query: str) -> Tuple[str, Dict[str, str]]:
+        """
+        Simple spelling correction using known_terms.
+        For production, use a domain-specific spell checker.
+        """
+        words = query.split()
+        corrections = {}
+        corrected_words = []
+        
+        for word in words:
+            word_lower = word.lower()
+            if word_lower in self.known_terms:
+                corrected_words.append(word)
+            else:
+                # Try to find a correction
+                correction = self._find_closest_term(word_lower)
+                if correction and correction != word_lower:
+                    corrections[word] = correction
+                    corrected_words.append(correction)
+                else:
+                    corrected_words.append(word)
+        
+        return " ".join(corrected_words), corrections
+    
+    def _find_closest_term(self, word: str, max_distance: int = 2) -> Optional[str]:
+        """
+        Find closest term using Levenshtein distance.
+        Only consider terms that are not too far.
+        """
+        # Simple Levenshtein distance implementation
+        def levenshtein(s1: str, s2: str) -> int:
+            if len(s1) < len(s2):
+                return levenshtein(s2, s1)
+            if len(s2) == 0:
+                return len(s1)
+            
+            previous_row = range(len(s2) + 1)
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1
+                    deletions = current_row[j] + 1
+                    substitutions = previous_row[j] + (c1 != c2)
+                    current_row.append(min(insertions, deletions, substitutions))
+                previous_row = current_row
+            
+            return previous_row[-1]
+        
+        # Only search if word is at least 3 characters
+        if len(word) < 3:
+            return None
+        
+        # Search for close terms
+        best_match = None
+        best_distance = float('inf')
+        
+        # Limit search to terms that start with same letter for speed
+        candidates = [t for t in self.known_terms if t.startswith(word[0])]
+        
+        for term in candidates:
+            if len(term) < 3:
+                continue
+            dist = levenshtein(word, term)
+            if dist < best_distance and dist <= max_distance:
+                best_distance = dist
+                best_match = term
+        
+        return best_match
+    
+    def _extract_prf_terms(
+        self,
+        top_docs: List[Dict],
+        num_terms: int = 2,
+        min_term_freq: int = 1,
+        max_term_freq_ratio: float = 0.3,
+        min_idf_threshold: float = 1.0,
+        strategy: str = "conservative",
     ) -> List[str]:
         """
-        Generate up to n alternative query suggestions for the UI.
-
-        Sources (in priority order):
-          1. PRF terms — different subsets give different search angles
-          2. Medical thesaurus — replace a key term with a clinical synonym
-
-        Each suggestion is a complete query string ready to paste into the search box.
+        Extract PRF terms with intelligent filtering.
+        
+        Strategy-specific behavior:
+        - conservative: Only add very rare, domain-specific terms
+        - moderate: Add terms with high IDF, avoid common terms
+        - aggressive: Add more terms, less filtering
         """
-        base_tokens = self.preprocessor.process(query)
-        suggestions: List[str] = []
-
-        # 1. PRF-based suggestions (need top_docs)
-        if top_docs and len(top_docs) >= 2 and base_tokens:
-            candidates = self.prf_service.extract_terms(
-                top_docs, base_tokens, num_terms=n * 2
-            )
-            for term in candidates:
-                if len(suggestions) >= n:
-                    break
-                suggestions.append(f"{query} {term}")
-
-        # 2. Thesaurus-based suggestions (fill remaining slots)
-        if len(suggestions) < n:
-            for token in base_tokens:
-                if len(suggestions) >= n:
-                    break
-                alts = MEDICAL_THESAURUS.get(token.lower()) or MEDICAL_THESAURUS.get(token)
-                if not alts:
+        # Adjust parameters based on strategy
+        if strategy == "conservative":
+            num_terms = min(num_terms, 1)
+            max_term_freq_ratio = 0.1
+            min_idf_threshold = 2.0
+        elif strategy == "moderate":
+            num_terms = min(num_terms, 2)
+            max_term_freq_ratio = 0.2
+            min_idf_threshold = 1.5
+        elif strategy == "aggressive":
+            num_terms = min(num_terms, 4)
+            max_term_freq_ratio = 0.4
+            min_idf_threshold = 0.8
+        
+        # Collect terms from top documents
+        term_scores = {}
+        
+        for doc in top_docs:
+            doc_id = doc.get("doc_id", "")
+            doc_text = self._get_doc_text(doc_id)
+            if not doc_text:
+                continue
+            
+            # Tokenize and count terms
+            terms = self._tokenize(doc_text)
+            term_counts = Counter(terms)
+            
+            for term, count in term_counts.items():
+                if term in self.stopwords:
                     continue
-                # Replace the token with the first thesaurus alternative
-                alt = alts[0]
-                pattern = re.compile(re.escape(token), re.IGNORECASE)
-                new_query = pattern.sub(alt, query, count=1)
-                if new_query.lower() != query.lower():
-                    suggestions.append(new_query)
-
-        return suggestions[:n]
-
-    # ── History (lightweight, UI-only) ────────────────────────────────────────
-
-    def update_history(self, query: str, results: Optional[List[Dict]] = None):
-        tokens = self.preprocessor.process(query)
-        for t in tokens:
-            if len(t) > 2 and t not in self.stopwords:
-                self.user_history_terms[t] = self.user_history_terms.get(t, 0) + 1
-
-    def save_history(self, path: str = "data/user_history.pkl"):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(self.user_history_terms, f)
-
-    def load_history(self, path: str = "data/user_history.pkl"):
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                self.user_history_terms = pickle.load(f)
-            return True
-        return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "known_terms": len(self.known_terms),
-            "total_docs":  self.total_docs,
-            "history_len": len(self.user_history_terms),
-        }
+                if len(term) < 3:
+                    continue
+                
+                # IDF weight
+                df = self.term_frequencies.get(term, 0)
+                idf = math.log((self.total_docs + 1) / (df + 1)) if df > 0 else 0
+                
+                # Frequency ratio
+                freq_ratio = df / self.total_docs if self.total_docs > 0 else 1.0
+                
+                # Score: term frequency * IDF
+                score = count * idf
+                
+                # Apply filters
+                if df < min_term_freq:
+                    continue
+                if freq_ratio > max_term_freq_ratio:
+                    continue
+                if idf < min_idf_threshold:
+                    continue
+                
+                # Bonus for medical terms
+                if term in self.medical_terms:
+                    score *= 1.5
+                
+                if term not in term_scores or score > term_scores[term]:
+                    term_scores[term] = score
+        
+        # Sort by score and return top terms
+        sorted_terms = sorted(term_scores.items(), key=lambda x: x[1], reverse=True)
+        return [term for term, score in sorted_terms[:num_terms]]
+    
+    def _get_doc_text(self, doc_id: str) -> str:
+        """Get document text by doc_id - overridden in evaluation."""
+        # This will be overridden when instantiated
+        return ""
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """Simple tokenizer."""
+        # Convert to lowercase and split on non-alphanumeric
+        text = text.lower()
+        tokens = re.findall(r'[a-z0-9]+', text)
+        return tokens

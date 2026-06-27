@@ -4,6 +4,8 @@ class Config:
     INDEX_PATH = "data/index"
     DATASET_NAME = "clinicaltrials/2017/trec-pm-2017"
     MAX_DOCS = None
-    EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    
+    # ✅ استخدام النموذج الطبي كافتراضي
+    EMBEDDING_MODEL = "clinical"  # أو "pritamdeka/S-PubMedBert-MS-MARCO"
+    
     RRF_K = 60
-
