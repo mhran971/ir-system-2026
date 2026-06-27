@@ -25,8 +25,10 @@ class EmbeddingModel:
     MODELS = {
         "fast":    "all-MiniLM-L6-v2",        # 80MB,  384-dim, fastest
         "balanced": "all-mpnet-base-v2",        # 420MB, 768-dim, best quality
+        "clinical": "pritamdeka/S-PubMedBert-MS-MARCO", # 420MB, 768-dim, biomedical
         "multilingual": "paraphrase-multilingual-MiniLM-L12-v2",  # for Arabic too
     }
+
 
     def __init__(self, model_key: str = "fast"):
         """

@@ -1,18 +1,61 @@
 # services/retrieval/bm25_search_service.py
 import os
 import pickle
+import math
 from typing import List, Dict, Any, Optional
 from services.query_processing.query_processor import QueryProcessor
 from services.indexing.document_store import DocumentStore
 from services.indexing.inverted_index import InvertedIndex
-from rank_bm25 import BM25Okapi  # ✅ مكتبة rank_bm25
+from rank_bm25 import BM25Okapi
+
+
+class BM25ScorerCompat:
+    """
+    Compatibility class to expose math scoring functions to the UI
+    without introducing heavy disk-bound or redundant dependencies.
+    """
+    def __init__(self, service: "BM25SearchService"):
+        self.service = service
+
+    @property
+    def k1(self) -> float:
+        return self.service.k1
+
+    @property
+    def b(self) -> float:
+        return self.service.b
+
+    def compute_idf(self, df: int, total_docs: int) -> float:
+        """Calculate Inverse Document Frequency using the BM25 formula."""
+        if df <= 0 or total_docs <= 0:
+            return 0.0
+        numerator = total_docs - df + 0.5
+        denominator = df + 0.5
+        if numerator <= 0 or denominator <= 0:
+            return 0.0
+        return max(math.log(numerator / denominator), 0.0)
+
+    def score_term(self, tf: int, doc_len: int, avg_doc_len: float, idf: float) -> float:
+        """Calculate the BM25 score for a single term in a document."""
+        if tf <= 0 or idf <= 0 or avg_doc_len <= 0:
+            return 0.0
+        denominator = tf + self.k1 * ((1.0 - self.b) + self.b * (doc_len / avg_doc_len))
+        if denominator <= 0:
+            return 0.0
+        return idf * (tf * (self.k1 + 1.0)) / denominator
 
 
 class BM25SearchService:
     """
     Service layer orchestrator for the BM25 retrieval model.
-    Uses rank_bm25 library for fast BM25 scoring.
+    Caches model data in class-level variables to allow instant load
+    and sub-second query processing.
     """
+    # Class-level cache to store large data structures in memory
+    _cached_inverted_index: Optional[InvertedIndex] = None
+    _cached_bm25: Optional[BM25Okapi] = None
+    _cached_doc_ids: List[str] = []
+
     def __init__(
         self,
         query_processor: Optional[QueryProcessor] = None,
@@ -26,23 +69,35 @@ class BM25SearchService:
         
         # Load document store cache (metadata only)
         if self.document_store.total_docs == 0:
-            doc_paths = [
-                'data/processed/processed_docs.pkl',
-            ]
+            doc_paths = ['data/processed/processed_docs.pkl']
             self.document_store.load(doc_paths)
             
-        self.inverted_index = inverted_index or self._load_inverted_index()
-        
+        # Retrieve inverted index from provided parameter, memory cache, or disk
+        if inverted_index is not None:
+            self.inverted_index = inverted_index
+        elif BM25SearchService._cached_inverted_index is not None:
+            self.inverted_index = BM25SearchService._cached_inverted_index
+        else:
+            self.inverted_index = self._load_inverted_index()
+            BM25SearchService._cached_inverted_index = self.inverted_index
+            
         self._k1 = k1
         self._b = b
         
-        # ✅ استخدام rank_bm25
         self.bm25 = None
         self.doc_ids = []
         self._load_or_build_bm25()
 
+    @classmethod
+    def clear_cache(cls):
+        """Clean up all memory-cached index and model instances."""
+        cls._cached_inverted_index = None
+        cls._cached_bm25 = None
+        cls._cached_doc_ids = []
+        print("🧹 [BM25SearchService] In-memory cache cleared successfully.")
+
     def _load_inverted_index(self) -> InvertedIndex:
-        """Load inverted index from disk."""
+        """Load inverted index from disk files."""
         index_paths = [
             'data/index/inverted_index.pkl',
             'data/index/bm25_index.pkl',
@@ -77,8 +132,16 @@ class BM25SearchService:
         return index
 
     def _load_or_build_bm25(self):
-        """Load precomputed BM25 model or build on-demand."""
-        # محاولة تحميل النموذج المحفوظ
+        """Load precomputed BM25 model or build on-demand (utilizes class memory cache)."""
+        if BM25SearchService._cached_bm25 is not None:
+            self.bm25 = BM25SearchService._cached_bm25
+            self.doc_ids = BM25SearchService._cached_doc_ids
+            # Update current runtime hyperparameters
+            self.bm25.k1 = self._k1
+            self.bm25.b = self._b
+            print("✅ [BM25SearchService] Loaded BM25 model from memory cache")
+            return
+
         bm25_model_path = 'data/index/bm25_model.pkl'
         
         if os.path.exists(bm25_model_path):
@@ -87,15 +150,21 @@ class BM25SearchService:
                     data = pickle.load(f)
                 self.bm25 = data['bm25']
                 self.doc_ids = data['doc_ids']
-                # تحديث المعاملات
+                
+                # Apply current hyperparameters
                 self.bm25.k1 = self._k1
                 self.bm25.b = self._b
-                print(f"✅ [BM25SearchService] Loaded precomputed BM25 model from {bm25_model_path}")
+                
+                # Store in class-level cache
+                BM25SearchService._cached_bm25 = self.bm25
+                BM25SearchService._cached_doc_ids = self.doc_ids
+                
+                print(f"✅ [BM25SearchService] Loaded and cached BM25 model from {bm25_model_path}")
                 return
             except Exception as e:
                 print(f"⚠️ [BM25SearchService] Error loading BM25 model: {e}. Building from store...")
         
-        # بناء النموذج من الصفر
+        # Build model if cache and files do not exist
         print("⏳ [BM25SearchService] Building BM25 model from document store...")
         self.doc_ids = list(self.document_store.get_all_documents().keys())
         tokenized_corpus = []
@@ -109,7 +178,11 @@ class BM25SearchService:
             return
 
         self.bm25 = BM25Okapi(tokenized_corpus, k1=self._k1, b=self._b)
-        print(f"✅ [BM25SearchService] BM25 model built with {len(self.doc_ids)} documents")
+        
+        # Store in class-level cache
+        BM25SearchService._cached_bm25 = self.bm25
+        BM25SearchService._cached_doc_ids = self.doc_ids
+        print(f"✅ [BM25SearchService] BM25 model built with {len(self.doc_ids)} docs and cached in memory")
 
     @property
     def k1(self) -> float:
@@ -135,6 +208,11 @@ class BM25SearchService:
         if self.bm25:
             self.bm25.b = value
 
+    @property
+    def scorer(self) -> BM25ScorerCompat:
+        """Expose compatible Scorer instance for UI statistics."""
+        return BM25ScorerCompat(self)
+
     def get_stats(self) -> Dict[str, Any]:
         """Returns index and store stats for the UI."""
         return {
@@ -147,8 +225,8 @@ class BM25SearchService:
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        Executes query retrieval and BM25 ranking using an optimized inverted index lookup
-        to avoid MemoryError and speed up processing by 100x.
+        Executes query retrieval and BM25 ranking.
+        Uses highly optimized inner-loop calculations and avoids posting list cloning.
         """
         if not query or not query.strip():
             return []
@@ -166,44 +244,54 @@ class BM25SearchService:
         k1 = self._k1
         b = self._b
         
-        # Calculate scores for documents that contain the terms
+        # Precompute constants to optimize mathematical ops inside inner loops
+        k1_plus_one = k1 + 1.0
+        b_over_avg_doc_len = b / avg_doc_len if avg_doc_len > 0 else 0.0
+        one_minus_b = 1.0 - b
+        
+        doc_lengths = self.inverted_index._doc_lengths
+        total_docs = self.inverted_index.total_documents
+        doc_frequency = self.inverted_index._doc_frequency
+        index_data = self.inverted_index._index
+        
         for term, count in query_term_counts.items():
             # Get IDF from rank_bm25 if available, else calculate it
             if self.bm25 and hasattr(self.bm25, 'idf') and term in self.bm25.idf:
                 idf = self.bm25.idf[term]
             else:
-                df = self.inverted_index._doc_frequency.get(term, 0)
+                df = doc_frequency.get(term, 0)
                 if df == 0:
                     continue
-                import math
                 # rank_bm25 formula: log(N - df + 0.5) - log(df + 0.5)
-                idf = math.log(self.inverted_index.total_documents - df + 0.5) - math.log(df + 0.5)
+                idf = math.log(total_docs - df + 0.5) - math.log(df + 0.5)
                 
-            postings = self.inverted_index.get_documents_for_term(term)
+            postings = index_data.get(term)
             if not postings:
                 continue
                 
+            # Precompute scale factor for term score
+            idf_k1_count = idf * k1_plus_one * count
+            
             for doc_id, tf in postings.items():
-                doc_len = self.inverted_index.get_document_length(doc_id)
-                denominator = tf + k1 * (1.0 - b + b * doc_len / avg_doc_len)
+                doc_len = doc_lengths.get(doc_id, 0)
+                denominator = tf + k1 * (one_minus_b + doc_len * b_over_avg_doc_len)
                 if denominator > 0:
-                    term_score = idf * (tf * (k1 + 1.0)) / denominator
-                    # Accumulate score multiplied by term frequency in query
-                    doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + (term_score * count)
+                    term_score = idf_k1_count * tf / denominator
+                    doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + term_score
                     
         scores = [(doc_id, score) for doc_id, score in doc_scores.items() if score > 0]
         if not scores:
             return []
             
-        # Sort and select top_k
         scores.sort(key=lambda x: x[1], reverse=True)
         top_scores = scores[:top_k]
         
         results = []
+        preview_len = 300
         for doc_id, score in top_scores:
             doc = self.document_store.get_doc(doc_id)
             text = doc['text'] if doc else ""
-            preview = text[:300] + ("..." if len(text) > 300 else "")
+            preview = text[:preview_len] + ("..." if len(text) > preview_len else "")
             results.append({
                 'doc_id': doc_id,
                 'score': round(score, 6),
@@ -214,13 +302,10 @@ class BM25SearchService:
         return results
 
     def get_term_score(self, doc_id: str, term: str) -> Dict[str, float]:
-        """
-        Get detailed term score for a specific document and term.
-        """
+        """Get detailed term score for a specific document and term."""
         if self.bm25 is None:
             return {'tf': 0.0, 'idf': 0.0, 'score': 0.0}
         
-        # الحصول على TF من الفهرس
         tf = self.inverted_index.get_term_frequency(term, doc_id)
         if tf == 0:
             return {'tf': 0.0, 'idf': 0.0, 'score': 0.0}
@@ -228,10 +313,8 @@ class BM25SearchService:
         doc_len = self.inverted_index.get_document_length(doc_id)
         avg_doc_len = self.bm25.avgdl
         
-        # الحصول على IDF من نموذج BM25
         idf = self.bm25.idf.get(term, 0.0)
         
-        # حساب مساهمة المصطلح باستخدام صيغة BM25
         k1 = self._k1
         b = self._b
         denominator = tf + k1 * (1 - b + b * doc_len / avg_doc_len)
