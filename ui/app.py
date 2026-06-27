@@ -16,6 +16,7 @@ from services.retrieval.vsm_search_service import VSMSearchService
 from services.retrieval.bm25_search_service import BM25SearchService
 from services.ranking.embeddings.bert_search_service import BERTSearchService
 from services.ranking.hybrid.hybrid_search_service import HybridSearchService
+from services.query_processing.query_refiner import QueryRefiner
 from services.clustering.clustering_service import ClusteringService
 
 def identity_analyzer(doc):
@@ -38,9 +39,7 @@ def get_bm25_service():
 
 @st.cache_resource
 def get_bert_service():
-    model_key = os.getenv("BERT_MODEL_KEY", "fast")
-    return BERTSearchService(model_key=model_key)
-
+    return BERTSearchService(model_key="fast")
 
 @st.cache_resource
 def get_hybrid_service():
@@ -49,6 +48,28 @@ def get_hybrid_service():
         bert_service=get_bert_service(),
     )
 
+@st.cache_resource
+def get_refiner(_bert_service=None):
+    """Load QueryRefiner with vocabulary from BM25 index."""
+    try:
+        bm25 = get_bm25_service()
+
+        known_terms = set(bm25.inverted_index.doc_frequency.keys())
+        term_freqs = dict(bm25.inverted_index.doc_frequency)
+        total_docs = bm25.document_store.total_docs
+
+        print(f"📚 Loaded {len(known_terms)} known terms for QueryRefiner")
+
+        return QueryRefiner(
+            known_terms=known_terms,
+            term_frequencies=term_freqs,
+            total_docs=total_docs,
+            bert_service=_bert_service,
+        )
+
+    except Exception as e:
+        st.warning(f"Could not load index vocabulary: {e}. Falling back to generic.")
+        return QueryRefiner()
 
 @st.cache_resource
 def get_clustering_service():
@@ -60,6 +81,8 @@ def main():
     st.set_page_config(page_title="IR System 2026", page_icon="🔍", layout="wide")
     st.title("🔍 Information Retrieval System 2026")
     st.markdown("---")
+
+    bert_svc = get_bert_service()
 
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -104,6 +127,23 @@ def main():
             bm25_candidates = st.slider("BM25 candidates", 20, 200, 100, 10)
 
         top_k = st.slider("📄 Number of results", 5, 50, 10)
+
+        # ── Query Refinement Options (UI ONLY - not used in evaluation) ──
+        st.markdown("---")
+        st.subheader("🧠 Query Formulation Assistance (UI Only)")
+
+        use_spelling = st.checkbox("✏️  Spelling Correction", value=True,
+                                   help="Medical-aware: corrects misspellings but protects gene names (KRAS, BRAF, etc.)")
+        use_prf = st.checkbox("🔥 PRF Expansion", value=True,
+                               help="Adds up to 3 corpus-derived terms from the top BM25 results (with BERT semantic weighting)")
+
+        if use_prf:
+            num_prf_terms = st.slider("Number of PRF terms", 1, 5, 3)
+        else:
+            num_prf_terms = 3
+
+        st.caption("💡 Query suggestions appear below search results")
+        st.caption("⚠️ Refinement is applied ONLY to UI search, NOT to evaluation")
 
         # ── Display Options ────────────────────────────────────────────
         st.markdown("---")
@@ -157,50 +197,76 @@ def main():
             t0 = time.time()
             results = []
             method_used = model
+            refined_query = query
+            refinement_info = {}
+            prf_docs = []
+
+            # Safely resolve sidebar-conditional variables
+            _bm25_candidates = locals().get('bm25_candidates', 100)
+            _fusion = locals().get('fusion', 'rrf')
+            _bm25_w = locals().get('bm25_w', 0.4)
+            _bert_w = locals().get('bert_w', 0.6)
 
             with st.spinner("🔍 Searching..."):
                 try:
-                    # Default values
-                    bm25_candidates = bm25_candidates if 'bm25_candidates' in locals() else 100
-                    fusion = fusion if 'fusion' in locals() else "rrf"
-                    bm25_w = bm25_w if 'bm25_w' in locals() else 0.4
-                    bert_w = bert_w if 'bert_w' in locals() else 0.6
+                    # ── Apply Query Refinement (UI ONLY) ──────────────────────
+                    refiner = get_refiner(_bert_service=bert_svc)
 
-                    # Execute search with original query (NO Refinement)
+                    if use_prf:
+                        prf_docs = get_bm25_service().search(query, top_k=10)
+
+                    refined = refiner.refine(
+                        query=query,
+                        apply_spelling=use_spelling,
+                        apply_prf=use_prf,
+                        top_docs=prf_docs,
+                        num_prf_terms=num_prf_terms,
+                        bert_query=query,
+                    )
+
+                    refined_query = refined['expanded_query']
+                    refinement_info = refined
+
+                    # ── Execute search by model ──────────────────────────────
                     if "BM25" in model and "Hybrid" not in model:
                         svc = get_bm25_service()
                         svc.k1 = k1
                         svc.b = b
-                        results = svc.search(query, top_k=top_k)
-                        method_used = f"BM25 (k1={k1}, b={b})"
+                        results = svc.search(refined_query, top_k=top_k)
+                        method_used = f"BM25 (k1={k1}, b={b}) + Refinement"
 
                     elif "Hybrid Serial" in model:
                         svc = get_hybrid_service()
                         svc.k1 = k1
                         svc.b = b
-                        results = svc.search(query, mode="serial", top_k=top_k,
-                                             bm25_candidates=bm25_candidates)
-                        method_used = f"Hybrid Serial"
+                        results = svc.search(refined_query, mode="serial", top_k=top_k,
+                                             bm25_candidates=_bm25_candidates, bert_query=query)
+                        method_used = "Hybrid Serial + Refinement"
 
                     elif "Hybrid Parallel" in model:
                         svc = get_hybrid_service()
                         svc.k1 = k1
                         svc.b = b
-                        results = svc.search(query, mode="parallel", fusion=fusion,
-                                             top_k=top_k, bm25_weight=bm25_w, bert_weight=bert_w)
-                        method_used = f"Hybrid Parallel {fusion.upper()}"
+                        results = svc.search(refined_query, mode="parallel", fusion=_fusion,
+                                             top_k=top_k, bm25_weight=_bm25_w, bert_weight=_bert_w,
+                                             bert_query=query)
+                        method_used = f"Hybrid Parallel {_fusion.upper()} + Refinement"
 
                     elif "VSM" in model:
-                        results = get_vsm_service().search(query, top_k=top_k)
-                        method_used = "VSM TF-IDF"
+                        results = get_vsm_service().search(refined_query, top_k=top_k)
+                        method_used = "VSM TF-IDF + Refinement"
 
                     elif "BERT" in model:
+                        # BERT uses original query (not expanded)
                         results = get_bert_service().search(query, top_k=top_k)
                         method_used = "BERT Semantic"
 
                     else:
-                        results = get_simple_service().search(query, top_k=top_k)
-                        method_used = "Simple TF-IDF"
+                        results = get_simple_service().search(refined_query, top_k=top_k)
+                        method_used = "Simple TF-IDF + Refinement"
+
+                    for r in results:
+                        r['refinement_info'] = refinement_info
 
                 except Exception as e:
                     st.error(f"Search error: {e}")
@@ -210,26 +276,61 @@ def main():
             elapsed = time.time() - t0
             
             st.session_state.last_search = {
+                "query": query,
                 "results": results,
                 "method_used": method_used,
+                "refined_query": refined_query,
+                "refinement_info": refinement_info,
                 "elapsed": elapsed,
-                "query": query,
+                "prf_docs": prf_docs,
+                "use_refinement": use_spelling or use_prf,
             }
 
-        # Check if we have results in session state to display
+        # ── Display results ──────────────────────────────────────────────────────
         if st.session_state.last_search is not None:
             results = st.session_state.last_search["results"]
             method_used = st.session_state.last_search["method_used"]
+            refined_query = st.session_state.last_search["refined_query"]
+            refinement_info = st.session_state.last_search["refinement_info"]
             elapsed = st.session_state.last_search["elapsed"]
             last_query = st.session_state.last_search["query"]
+            last_prf_docs = st.session_state.last_search.get("prf_docs", [])
+            use_refinement = st.session_state.last_search.get("use_refinement", False)
 
             if results:
                 st.success(f"✅ {len(results)} results in {elapsed:.3f}s")
                 st.caption(f"📐 Method: {method_used}")
 
+                # ── Show Refinement Summary (UI Only) ──────────────────────────
+                if use_refinement:
+                    with st.expander("🧠 Query Formulation Summary", expanded=False):
+                        st.write(f"**Original:** `{last_query}`")
+                        if refined_query != last_query:
+                            st.write(f"**Refined:** `{refined_query}`")
+                        if refinement_info.get('corrections_made'):
+                            st.write(f"**Spelling fixes:** `{refinement_info['corrections_made']}`")
+                        if refinement_info.get('prf_terms_added'):
+                            st.write(f"**PRF Terms Added:** `{refinement_info['prf_terms_added']}`")
+
+                # ── Query Suggestions ──────────────────────────────────────────
+                try:
+                    refiner = get_refiner(_bert_service=bert_svc)
+                    suggestions = refiner.suggest_queries(last_query, top_docs=last_prf_docs or results, n=3)
+                    if suggestions:
+                        st.markdown("**💡 Try also:**")
+                        sug_cols = st.columns(len(suggestions))
+                        for i, sug in enumerate(suggestions):
+                            with sug_cols[i]:
+                                label = sug if len(sug) <= 45 else sug[:42] + "..."
+                                if st.button(f"🔍 {label}", key=f"sug_{i}", use_container_width=True):
+                                    st.session_state.query = sug
+                                    st.rerun()
+                except Exception:
+                    pass
+
                 st.markdown("---")
 
-                # Show tabs for Standard List vs Clustered Analysis
+                # ── Tabs: Standard List vs Clustered Analysis ──────────────────
                 view_tab1, view_tab2 = st.tabs(["📋 Standard List", "🧩 Clustered Analysis"])
                 
                 with view_tab1:
@@ -260,7 +361,6 @@ def main():
                 
                 with view_tab2:
                     st.subheader("🧩 Clustered View (PCA Projected)")
-                    # Run clustering service
                     try:
                         clustering_svc = get_clustering_service()
                         cluster_results = clustering_svc.cluster_search_results(
@@ -274,231 +374,43 @@ def main():
                         
                         if scatter_data:
                             import pandas as pd
-                            import numpy as np
-                            import plotly.graph_objects as go
+                            import plotly.express as px
                             
                             df = pd.DataFrame(scatter_data)
-                            
-                            # Map doc_id to a simple short ID (D1, D2, D3...)
-                            doc_id_to_short = {doc["doc_id"]: f"D{idx}" for idx, doc in enumerate(results, 1)}
-                            df["short_id"] = df["doc_id"].map(doc_id_to_short)
-                            
-                            # Define beautiful curated colors
-                            CLUSTER_STYLES = {
-                                0: {"color": "#2563EB", "bg_color": "#EFF6FF", "border_color": "#BFDBFE", "text_color": "#1E40AF"},
-                                1: {"color": "#059669", "bg_color": "#ECFDF5", "border_color": "#A7F3D0", "text_color": "#065F46"},
-                                2: {"color": "#DC2626", "bg_color": "#FEF2F2", "border_color": "#FCA5A5", "text_color": "#991B1B"},
-                                3: {"color": "#D97706", "bg_color": "#FFFBEB", "border_color": "#FDE68A", "text_color": "#92400E"},
-                                4: {"color": "#7C3AED", "bg_color": "#F5F3FF", "border_color": "#DDD6FE", "text_color": "#5B21B6"},
-                                5: {"color": "#DB2777", "bg_color": "#FDF2F8", "border_color": "#FBCFE8", "text_color": "#9D174D"},
-                                6: {"color": "#0891B2", "bg_color": "#ECFEFF", "border_color": "#CFFAFE", "text_color": "#155E75"},
-                                7: {"color": "#0D9488", "bg_color": "#F0FDF4", "border_color": "#CCFBF1", "text_color": "#115E59"}
-                            }
-                            
-                            def get_cluster_emoji(label_str: str) -> str:
-                                label_lower = label_str.lower()
-                                if any(w in label_lower for w in ["cancer", "tumor", "carcinoma", "melanoma", "lymphoma", "leukemia", "sarcoma", "oncology", "breast", "lung", "colon"]):
-                                    return "🎗️"
-                                elif any(w in label_lower for w in ["gene", "dna", "rna", "kras", "braf", "egfr", "her2", "mutat"]):
-                                    return "🧬"
-                                elif any(w in label_lower for w in ["drug", "therap", "chemo", "immunother", "regimen"]):
-                                    return "💊"
-                                elif any(w in label_lower for w in ["pediatric", "child", "children", "boy", "girl"]):
-                                    return "🧒"
-                                elif any(w in label_lower for w in ["cardiac", "heart", "coronary", "arter"]):
-                                    return "❤️"
-                                elif any(w in label_lower for w in ["brain", "neuro", "meningi"]):
-                                    return "🧠"
-                                elif any(w in label_lower for w in ["food", "diet", "nutrition", "eat", "meal"]):
-                                    return "🥗"
-                                elif any(w in label_lower for w in ["sport", "exercise", "train", "physic"]):
-                                    return "⚽"
-                                else:
-                                    return "📋"
-                            
-                            # Compute overall range for adaptive ellipse sizing
-                            x_range = max(df["x"].max() - df["x"].min(), 0.1)
-                            y_range = max(df["y"].max() - df["y"].min(), 0.1)
-                            default_a = max(x_range * 0.08, 0.15)
-                            default_b = max(y_range * 0.08, 0.15)
-                            
-                            # Create Plotly figure
-                            fig = go.Figure()
-                            
-                            # 1. Add cluster points, ellipses, and centers
-                            cluster_ids = sorted(df["cluster_id"].unique())
-                            for cid in cluster_ids:
-                                cluster_df = df[df["cluster_id"] == cid]
-                                style = CLUSTER_STYLES.get(cid % len(CLUSTER_STYLES))
-                                color = style["color"]
-                                
-                                label_str = cluster_labels[cid]
-                                keywords = label_str.split(":", 1)[1].strip() if ":" in label_str else label_str
-                                clean_label = f"Cluster {cid + 1} ({keywords.title()})"
-                                
-                                fig.add_trace(go.Scatter(
-                                    x=cluster_df["x"],
-                                    y=cluster_df["y"],
-                                    mode="markers+text",
-                                    marker=dict(
-                                        size=11,
-                                        color=color,
-                                        line=dict(width=1, color="white")
-                                    ),
-                                    text=cluster_df["short_id"],
-                                    textposition="top center",
-                                    textfont=dict(size=10, family="Outfit, sans-serif", color="#374151"),
-                                    name=clean_label,
-                                    hovertext=cluster_df.apply(lambda r: f"<b>{r['short_id']} ({r['doc_id']})</b><br>Score: {r['score']:.4f}<br>{r['snippet']}", axis=1),
-                                    hoverinfo="text",
-                                    showlegend=True
-                                ))
-                                
-                                # Calculate center of this cluster
-                                xc = cluster_df["x"].mean()
-                                yc = cluster_df["y"].mean()
-                                
-                                # Add cluster center 'X' marker
-                                fig.add_trace(go.Scatter(
-                                    x=[xc],
-                                    y=[yc],
-                                    mode="markers",
-                                    marker=dict(
-                                        symbol="x",
-                                        size=14,
-                                        color=color,
-                                        line=dict(width=2)
-                                    ),
-                                    showlegend=False,
-                                    hoverinfo="skip"
-                                ))
-                                
-                                # Calculate and add cluster boundary ellipse
-                                if len(cluster_df) >= 2:
-                                    xmin, xmax = cluster_df["x"].min(), cluster_df["x"].max()
-                                    ymin, ymax = cluster_df["y"].min(), cluster_df["y"].max()
-                                    a = max((xmax - xmin) / 2 * 1.3, default_a)
-                                    b = max((ymax - ymin) / 2 * 1.3, default_b)
-                                else:
-                                    a, b = default_a, default_b
-                                    
-                                fig.add_shape(
-                                    type="circle",
-                                    xref="x", yref="y",
-                                    x0=xc - a, y0=yc - b,
-                                    x1=xc + a, y1=yc + b,
-                                    line=dict(color=color, width=1, dash="dot"),
-                                    fillcolor=color,
-                                    opacity=0.08,
-                                )
-                                
-                            # 2. Add Cluster Center dummy trace for the legend
-                            fig.add_trace(go.Scatter(
-                                x=[None],
-                                y=[None],
-                                mode="markers",
-                                marker=dict(symbol="x", size=10, color="#374151", line=dict(width=2)),
-                                name="Cluster Center",
-                                showlegend=True
-                            ))
-                            
-                            # 3. Update layout
-                            fig.update_layout(
-                                title=dict(
-                                    text="Document Clustering using K-Means",
-                                    font=dict(size=18, family="Outfit, sans-serif", color="#111827"),
-                                    x=0.5,
-                                    xanchor="center"
-                                ),
-                                xaxis=dict(
-                                    title="PCA Component 1",
-                                    gridcolor="rgba(0,0,0,0.05)",
-                                    zerolinecolor="rgba(0,0,0,0.1)",
-                                    showgrid=True,
-                                    zeroline=True,
-                                    titlefont=dict(family="Outfit, sans-serif", size=11)
-                                ),
-                                yaxis=dict(
-                                    title="PCA Component 2",
-                                    gridcolor="rgba(0,0,0,0.05)",
-                                    zerolinecolor="rgba(0,0,0,0.1)",
-                                    showgrid=True,
-                                    zeroline=True,
-                                    titlefont=dict(family="Outfit, sans-serif", size=11)
-                                ),
-                                plot_bgcolor="rgba(249, 250, 251, 0.6)",
-                                paper_bgcolor="rgba(0,0,0,0)",
-                                legend=dict(
-                                    bgcolor="rgba(255,255,255,0.9)",
-                                    bordercolor="rgba(229, 231, 235, 1)",
-                                    borderwidth=1,
-                                    font=dict(size=10, family="Outfit, sans-serif")
-                                ),
-                                margin=dict(l=40, r=40, t=50, b=40),
-                                hoverlabel=dict(
-                                    font_size=12,
-                                    font_family="Outfit, sans-serif"
-                                )
+                            fig = px.scatter(
+                                df,
+                                x="x",
+                                y="y",
+                                color="cluster_label",
+                                hover_data={"doc_id": True, "score": ":.4f", "snippet": True, "x": False, "y": False},
+                                title="2D Document Clusters (PCA)"
                             )
-                            
+                            fig.update_layout(
+                                legend_title_text='Clusters',
+                                xaxis_title="PCA Dimension 1",
+                                yaxis_title="PCA Dimension 2"
+                            )
                             st.plotly_chart(fig, use_container_width=True)
                             
-                            # 4. Render Grid of Cluster Cards
-                            st.markdown("<h3 style='font-family: Outfit, sans-serif; text-align: center; margin-bottom: 20px;'>📁 Cluster Content Overview</h3>", unsafe_allow_html=True)
-                            
-                            max_cols_per_row = 3
-                            for i in range(0, len(cluster_ids), max_cols_per_row):
-                                row_cids = cluster_ids[i : i + max_cols_per_row]
-                                cols = st.columns(len(row_cids))
-                                for idx, cid in enumerate(row_cids):
-                                    with cols[idx]:
-                                        style = CLUSTER_STYLES.get(cid % len(CLUSTER_STYLES))
-                                        label_str = cluster_labels[cid]
-                                        keywords = label_str.split(":", 1)[1].strip() if ":" in label_str else label_str
-                                        cluster_title = f"Cluster {cid + 1} ({keywords.title()})"
-                                        cluster_emoji = get_cluster_emoji(keywords)
-                                        
-                                        docs_in_cluster = grouped_results.get(cid, [])
-                                        
-                                        doc_list_html = ""
-                                        for doc in docs_in_cluster:
-                                            short_id = doc_id_to_short[doc["doc_id"]]
-                                            snippet = doc.get("text", "")
+                            st.markdown("### 📁 Documents by Topic Group")
+                            for cluster_id in sorted(cluster_labels.keys()):
+                                label = cluster_labels[cluster_id]
+                                docs_in_cluster = grouped_results.get(cluster_id, [])
+                                
+                                with st.expander(f"📂 {label} ({len(docs_in_cluster)} documents)", expanded=True):
+                                    for doc in docs_in_cluster:
+                                        col1, col2 = st.columns([4, 1])
+                                        with col1:
+                                            st.markdown(f"**📄 `{doc['doc_id']}`**")
+                                        with col2:
+                                            st.markdown(f"Score: `{doc['score']:.4f}`")
                                             
-                                            if len(snippet) > 85:
-                                                snippet = snippet[:82] + "..."
-                                                
-                                            doc_list_html += f"""
-                                            <div style="display: flex; margin-bottom: 12px; font-family: 'Outfit', sans-serif; font-size: 0.88rem; line-height: 1.4; color: #374151; align-items: flex-start;">
-                                                <span style="color: {style['text_color']}; font-weight: 700; min-width: 28px; display: inline-block; margin-right: 6px;">{short_id}</span>
-                                                <span style="flex-grow: 1;">{snippet} <code style="font-size: 0.72rem; color: #9CA3AF;">({doc['doc_id']})</code></span>
-                                            </div>
-                                            """
-                                            
-                                        if not doc_list_html:
-                                            doc_list_html = "<div style='color: #9CA3AF; font-style: italic; font-size: 0.85rem;'>No documents in this cluster</div>"
-                                            
-                                        card_html = f"""
-                                        <div style="border: 1px solid {style['border_color']}; border-radius: 12px; background-color: white; margin-bottom: 20px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); min-height: 220px; display: flex; flex-direction: column;">
-                                            <div style="background-color: {style['bg_color']}; padding: 12px 16px; border-bottom: 1px solid {style['border_color']}; display: flex; justify-content: space-between; align-items: center;">
-                                                <span style="color: {style['text_color']}; font-weight: 700; font-size: 0.92rem; font-family: 'Outfit', sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 80%;">{cluster_title}</span>
-                                                <span style="font-size: 1.2rem;">{cluster_emoji}</span>
-                                            </div>
-                                            <div style="padding: 16px; flex-grow: 1; display: flex; flex-direction: column; justify-content: flex-start;">
-                                                {doc_list_html}
-                                            </div>
-                                        </div>
-                                        """
-                                        st.markdown(card_html, unsafe_allow_html=True)
-                                        
-                            st.markdown("""
-                                <div style="text-align: center; margin-top: 15px; margin-bottom: 25px;">
-                                    <span style="background-color: #F3F4F6; border: 1px dashed #D1D5DB; border-radius: 8px; padding: 8px 18px; font-size: 0.85rem; color: #4B5563; font-weight: 500; font-family: 'Outfit', sans-serif; display: inline-block; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-                                        📝 Documents in the same cluster are more similar to each other.
-                                    </span>
-                                </div>
-                            """, unsafe_allow_html=True)
-                            
+                                        if show_text and doc.get("text"):
+                                            preview = doc["text"][:max_text_len]
+                                            if len(doc["text"]) > max_text_len:
+                                                preview += "..."
+                                            st.markdown(f"> {preview}")
+                                        st.markdown(" ")
                         else:
                             st.info("Not enough results to cluster.")
                     except Exception as e:
@@ -508,28 +420,29 @@ def main():
             else:
                 st.warning("⚠️ No results found.")
 
-
         # ── About ─────────────────────────────────────────────────────────────────
         with st.expander("ℹ️ About this system"):
             st.markdown("""
             ### IR System 2026 – Medical Clinical Trials Search
 
-            **Retrieval Models**
-            - **BM25**: Best Matching 25 with configurable k1 and b parameters
-            - **VSM TF-IDF**: Vector Space Model with cosine similarity
-            - **BERT Embeddings**: Semantic search using Sentence-BERT
-            - **Hybrid Serial**: BM25 retrieves candidates → BERT reranks
-            - **Hybrid Parallel**: BM25 + BERT results fused via RRF or linear combination
+            **Query Formulation Assistance (UI Only)**
+            - **Spelling Correction**: Medical-aware — protects gene names (KRAS, BRAF, EGFR, etc.)
+              and mutation codes (G12D, V600E) from being "corrected" into common English words.
+            - **PRF Expansion**: Corpus-aware pseudo-relevance feedback with **BERT semantic weighting**.
+              Extracts up to 3 high-IDF terms co-occurring across the top BM25 results and boosts
+              those semantically similar to the original query, preventing topic drift.
 
-            **Clustering**
-            - K-Means clustering on BERT embeddings
-            - PCA projection for 2D visualization
-            - Interactive Plotly chart with cluster boundaries
+            **Query Suggestions** (shown after every search)
+            - Suggests alternative phrasings using PRF terms and medical synonyms.
 
-            **Dataset**
-            - ClinicalTrials.gov (TREC PM 2017)
-            - 241,006 indexed documents
-            - 30 evaluation queries with relevance judgments
+            **BERT & Hybrid models**
+            - BERT always encodes the *original* query (not the PRF-expanded one) so the dense
+              embedding isn't diluted by loosely related PRF terms.
+            - Hybrid modes use the expanded query for BM25 recall and the original for BERT.
+
+            **⚠️ Important Note**
+            - Query Refinement is applied **ONLY in the UI search**.
+            - The **evaluation pipeline runs WITHOUT refinement** to measure baseline model performance.
             """)
 
     with tab2:
@@ -591,6 +504,10 @@ def _render_stats(model: str):
 
 def _show_matching(result: dict, query: str, model: str):
     try:
+        ref_info = result.get('refinement_info', {})
+        if ref_info.get('expanded_query'):
+            st.write(f"**Query (refined):** `{ref_info['expanded_query']}`")
+
         if "BERT" in model and "Hybrid" not in model:
             svc = get_bert_service()
             tokens = svc.preprocessor.process(query)
@@ -666,19 +583,20 @@ def _show_evaluation_tab():
     st.header("📊 ClinicalTrials IR System Evaluation")
     st.markdown("""
     Evaluate all retrieval models using the official relevance judgments (qrels) from **ClinicalTrials (TREC PM 2017)**.
-    The evaluation shows performance metrics for each model on the test queries.
+    
+    ⚠️ **Note:** Evaluation runs **WITHOUT Query Refinement** to measure baseline model performance.
+    Query Refinement is applied **ONLY in the Search Engine tab** for interactive searching.
     """)
     
-    # Try to load baseline-only results first, then fallback to full results
     results_path = "data/evaluation/results_clinical_baseline_only.json"
     
+    # If baseline-only doesn't exist, try the full results
     if not os.path.exists(results_path):
-        # Fallback to the original results file
         results_path = "data/evaluation/results_clinical.json"
     
     if not os.path.exists(results_path):
         st.warning("⚠️ No evaluation results found. Please run the evaluation pipeline first.")
-        if st.button("🚀 Run End-to-End Evaluation Pipeline"):
+        if st.button("🚀 Run End-to-End Evaluation Pipeline (No Refinement)"):
             with st.spinner("Running evaluation (this may take a few minutes)..."):
                 import subprocess
                 try:
@@ -721,11 +639,22 @@ def _show_evaluation_tab():
     st.markdown("### 📊 Metric Comparison Table")
     st.dataframe(df, use_container_width=True, hide_index=True)
     
-    # Chart for visual comparison
+    # Let's separate Baseline vs Refinement for side-by-side comparison charts
     chart_rows = []
     for model_name, metrics in models_data.items():
+        if "Baseline" in model_name:
+            base_name = model_name.replace(" (Baseline)", "")
+            version = "Baseline (Before)"
+        elif "+ Refinement" in model_name:
+            base_name = model_name.replace(" (+ Refinement)", "")
+            version = "Enhanced (After)"
+        else:
+            base_name = model_name
+            version = "Standard"
+            
         chart_rows.append({
-            "Model": model_name,
+            "Model": base_name,
+            "Version": version,
             "MAP": metrics.get("map", 0),
             "nDCG@10": metrics.get("ndcg_cut_10", 0),
             "P@10": metrics.get("P_10", 0),
@@ -738,22 +667,35 @@ def _show_evaluation_tab():
     
     metric_to_plot = st.selectbox("Select metric to visualize", ["MAP", "nDCG@10", "P@10", "Recall@100"])
     
-    # Sort by selected metric descending
-    df_chart_sorted = df_chart.sort_values(by=metric_to_plot, ascending=False)
+    # Pivot for side-by-side plotting: index=Model, columns=Version, values=metric
+    df_pivot = df_chart.pivot(index="Model", columns="Version", values=metric_to_plot)
     
-    st.bar_chart(df_chart_sorted.set_index("Model")[metric_to_plot], use_container_width=True)
+    st.bar_chart(df_pivot, use_container_width=True)
     
     # Highlight achievements
     st.markdown("### 💡 Key Evaluation Findings")
+    best_base_model = ""
+    best_base_score = -1
+    best_enh_model = ""
+    best_enh_score = -1
     
-    best_model = df_chart.loc[df_chart[metric_to_plot].idxmax()]
-    
+    for row in chart_rows:
+        score = row[metric_to_plot]
+        if row["Version"] == "Baseline (Before)":
+            if score > best_base_score:
+                best_base_score = score
+                best_base_model = row["Model"]
+        elif row["Version"] == "Enhanced (After)":
+            if score > best_enh_score:
+                best_enh_score = score
+                best_enh_model = row["Model"]
+                
     st.info(f"🏆 **Best Performing Model ({metric_to_plot}):**")
-    st.markdown(f"- **Model:** `{best_model['Model']}`")
-    st.markdown(f"- **Score:** `{best_model[metric_to_plot]:.4f}`")
+    st.markdown(f"- **Baseline (Before Improvements):** `{best_base_model}` with `{best_base_score:.4f}`")
+    st.markdown(f"- **Enhanced (After Improvements):** `{best_enh_model}` with `{best_enh_score:.4f}`")
     
     st.markdown("---")
-    if st.button("🔄 Re-run Evaluation Pipeline", key="btn_rerun_eval"):
+    if st.button("🔄 Re-run Evaluation Pipeline (No Refinement)", key="btn_rerun_eval"):
         with st.spinner("Re-running evaluation (this may take a few minutes)..."):
             import subprocess
             try:
