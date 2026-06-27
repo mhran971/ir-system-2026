@@ -479,49 +479,91 @@ class QueryProcessor:
 
 **الملف:** `services/query_processing/query_refiner.py`
 
+### هيكل الخدمة
+
+يعتمد المُحسِّن على ثلاث فئات متخصصة:
+
+| الفئة | الدور |
+|-------|-------|
+| `MedicalSpeller` | تصحيح الإملاء مع حماية الأسماء الطبية |
+| `MedicalPRF` | استخراج مصطلحات PRF بوزن دلالي عبر BERT |
+| `QueryRefiner` | المُنسِّق الرئيسي الذي يجمع الخدمتَين |
+
 ### استراتيجيات التحسين
 
-#### 1. تصحيح الإملاء (Spelling Correction)
+#### 1. تصحيح الإملاء الطبي (MedicalSpeller)
 
 ```python
-def _correct_spelling(self, query: str):
-    for word in query.split():
-        if word not in self.known_terms:
-            correction = self._find_closest_term(word)
+class MedicalSpeller:
+    def correct(self, query: str) -> Tuple[str, List[Tuple[str, str]]]:
+        for tok in word_tokenize(query):
+            if self._should_protect(tok): ...  # تخطي
+            candidate = self.spell_checker.correction(tok)
+            if candidate and candidate.lower() in self.known_terms:
+                # استبدال
 ```
 
-**الخوارزمية:** مسافة Levenshtein (حذف، إضافة، استبدال) مع:
-- حد أقصى للمسافة: 2 (معاملتان تعديليتان)
-- البحث فقط في المصطلحات التي تبدأ بنفس الحرف (للسرعة)
-- حد أدنى لطول الكلمة: 3 أحرف (لتجنب التصحيح الخاطئ)
+**مكتبة التصحيح:** `pyspellchecker` (SpellChecker) — تُحسب مسافة التحرير داخلياً.
 
-#### 2. توسيع الاستعلام بـ PRF (Pseudo-Relevance Feedback)
+**آلية الحماية (`_should_protect`):**
+
+| شرط الحماية | مثال محمي |
+|------------|-----------|
+| يحتوي على أرقام | `CDK4/6`, `BRAF-V600E` |
+| يحتوي على أحرف كبيرة | `KRAS`, `HER2` |
+| طوله < 3 أحرف | `TP` |
+| موجود في `_PROTECTED_GENES` | `egfr`, `braf`, `kras`, `brca1`... |
+
+**القيد الأساسي:** يُقبَل التصحيح فقط إذا كانت الكلمة المقترحة موجودة في `known_terms` (معجم الفهرس)، مما يمنع استبدال المصطلحات الطبية الصحيحة بكلمات إنجليزية شائعة.
+
+#### 2. توسيع الاستعلام بـ PRF الدلالي (MedicalPRF)
 
 ```python
-def _extract_prf_terms(self, top_docs, num_terms, strategy):
-    for doc in top_docs:
-        terms = tokenize(doc_text)
-        for term in terms:
-            idf = log((total_docs + 1) / (df + 1))
-            score = term_count * idf
+class MedicalPRF:
+    def extract_terms(self, top_docs, original_tokens, original_query, num_terms):
+        # يستخدم أفضل 10 وثائق (top_docs[:10])
+        # min_df = 3  (مصطلح يجب أن يظهر في ≥ 3 وثائق)
+        # score = total_tf × IDF × gene_boost × semantic_weight
 ```
 
-**الخوارزمية:**
-1. تنفيذ بحث أولي وأخذ أفضل 5 وثائق
-2. استخراج المصطلحات من هذه الوثائق
-3. ترتيبها بـ (TF في الوثيقة × IDF) — مصطلحات نادرة ومتكررة في نتائج مرتبطة
-4. إضافة أفضل N مصطلح للاستعلام
+**خطوات الخوارزمية:**
+1. معالجة أفضل **10 وثائق** مرشحة (بدلاً من 5 سابقاً)
+2. استخراج المصطلحات مع تصفية `_PRF_EXCLUDED` (كلمات نموذجية في التجارب السريرية مثل *patient, trial, dose*)
+3. تطبيق **حد أدنى doc_frequency = 3** لتصفية الضجيج
+4. حساب درجة كل مصطلح:
 
-**استراتيجيات PRF:**
+$$\text{score}(t) = \text{total\_tf}(t) \times \text{IDF}(t) \times \text{gene\_boost}(t) \times \text{semantic\_weight}(t)$$
 
-| الاستراتيجية | عدد المصطلحات | max_freq_ratio | min_idf |
-|-------------|--------------|----------------|---------|
-| `conservative` | 1 | 0.10 | 2.0 |
-| `moderate` | 2 | 0.20 | 1.5 |
-| `aggressive` | 4 | 0.40 | 0.8 |
+| المكوّن | القيمة | الغرض |
+|---------|--------|--------|
+| `gene_boost` | 2.5 إذا يحتوي أرقام أو أحرف كبيرة، وإلا 1.0 | مكافأة أسماء الجينات والطفرات |
+| `semantic_weight` | `0.5 + 0.5 × max(0, cosine_sim)` | مكافأة المصطلحات قريبة الدلالة من الاستعلام |
 
-**سبب وجود ثلاث استراتيجيات:**
-في المجال الطبي، الاستعلام العدواني قد يُدخل مصطلحات غير ذات صلة (drift). الاستراتيجية المحافظة آمنة للاستعلامات القصيرة والمحددة.
+**الوزن الدلالي عبر BERT:**
+إذا تم تمرير `bert_service`، يُشفَّر الاستعلام الأصلي ومصطلح PRF المرشح كمتجهَي BERT مُطبَّعَي L2، ثم يُحسَب dot product (= cosine similarity). المصطلحات ذات التشابه السلبي تحصل على وزن مخفَّض (0.5)، والمصطلحات ذات التشابه العالي تُعزَّز حتى (1.0).
+
+**ما تم إزالته مقارنةً بالإصدار السابق:**
+- ❌ التوسيع بالمرادفات (`apply_synonyms`) — أُزيل من `refine()` لأنه كان يُدخل مصطلحات غير ذات صلة ويخفض MAP
+- ❌ `QuerySegmenter` — أُزيل لأن تقطيع استعلامات TREC PM يحذف معايير الأهلية
+- ❌ تكرار الرموز (Token Repetition) — أُزيل لأنه يُشوّه TF في BM25
+- ❌ استراتيجيات PRF الثلاث (conservative/moderate/aggressive) — استُبدلت بنهج موحَّد أكثر دقة
+
+**المعلمات المقبولة بصمت (Legacy Compatibility):**
+`apply_synonyms`, `apply_history`, `apply_profile`, `synonym_limit` لا تزال مقبولة كمعاملات لكنها مُهمَلة داخلياً حتى لا ينكسر الكود القديم.
+
+#### 3. اقتراح الاستعلامات — `suggest_queries()`
+
+هذه وظيفة جديدة مُضافة لواجهة المستخدم:
+
+```python
+def suggest_queries(self, query, top_docs=None, n=3) -> List[str]:
+    # المصدر 1: مصطلحات PRF — تُنتج استعلامات من زوايا مختلفة
+    # المصدر 2: المرادف الطبي (MEDICAL_THESAURUS) — يستبدل مصطلحاً رئيسياً
+```
+
+يُنتج حتى `n` استعلامات بديلة جاهزة للصق في شريط البحث، مستخدماً:
+1. مصطلحات PRF كإضافات للاستعلام الأصلي
+2. معجم `MEDICAL_THESAURUS` المدمج (مثال: `cancer` → `carcinoma, malignancy, neoplasm`)
 
 ---
 
@@ -819,16 +861,35 @@ st.write(f"TF={d['tf']:.4f} | IDF={d['idf']:.4f} | TF-IDF={d['tfidf']:.4f}")
 **الملف:** `api/main.py`
 
 ```
-GET  /                  → Health check
-POST /search            → تنفيذ البحث (جميع النماذج)
-POST /refine            → تحسين الاستعلام فقط
-GET  /stats             → إحصائيات الخدمات
-POST /term-details      → تفاصيل مصطلح في وثيقة
-GET  /documents/{id}    → جلب نص الوثيقة
-POST /evaluate          → تشغيل خط التقييم
+GET  /                        → Health check
+POST /search                  → تنفيذ البحث (جميع النماذج + تجميع اختياري)
+POST /refine                  → تحسين الاستعلام فقط (بدون بحث)
+GET  /models/{model}/stats    → إحصائيات نموذج محدد (bm25/vsm/bert/hybrid/simple)
+POST /term-details            → تفاصيل مصطلح في وثيقة (BM25 أو VSM)
+GET  /documents/{id}          → جلب نص الوثيقة
+GET  /evaluate                → استرجاع نتائج التقييم المحسوبة مسبقاً
+POST /evaluate/run            → تشغيل خط التقييم (يستغرق دقائق، timeout=600s)
 ```
 
+**ملاحظة حول نقطة التقييم:**
+- `GET /evaluate` يقرأ ملف `data/evaluation/results_clinical.json` المحفوظ مسبقاً.
+- `POST /evaluate/run` يُشغِّل `scripts/evaluate.py` كـ subprocess غير متزامن (`run_in_executor`) حتى لا يُعطَّل event loop الأساسي.
+
 **Pydantic Validation:** جميع الطلبات والاستجابات مُعرَّفة بـ Pydantic models مع validation تلقائي.
+
+**معاملات `POST /search` الأساسية:**
+
+| المعامل | النوع | الافتراضي | الوصف |
+|---------|-------|-----------|--------|
+| `query` | str | — | نص الاستعلام |
+| `model` | Literal | `"bm25"` | النموذج: bm25/vsm/bert/hybrid_serial/hybrid_parallel/simple |
+| `top_k` | int | 10 | عدد النتائج (1–200) |
+| `k1` / `b` | float | 1.5 / 0.75 | معاملات BM25 |
+| `fusion` | Literal | `"rrf"` | طريقة دمج Hybrid Parallel: rrf/linear |
+| `bm25_weight` / `bert_weight` | float | 0.4 / 0.6 | أوزان Hybrid Parallel |
+| `use_spelling` / `use_prf` | bool | True | تفعيل مراحل تحسين الاستعلام |
+| `cluster_results` | bool | False | تفعيل تجميع النتائج |
+| `n_clusters` | int | 4 | عدد التجميعات (2–10) |
 
 ---
 
